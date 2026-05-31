@@ -1,0 +1,27 @@
+# ── Environment & Secrets (NEVER commit these) ──────────────
+.env
+.env.*
+!.env.example
+
+# ── Credentials / test files ─────────────────────────────────
+email_test.js
+*_test_credentials*
+
+# ── Node ─────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ── Logs ─────────────────────────────────────────────────────
+logs/*.log
+logs/*.json
+
+# ── Uploads (user-generated files should not be in git) ──────
+uploads/
+
+# ── OS / Editor ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
