@@ -37,8 +37,8 @@ app.use(cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (curl, Postman, same-origin)
     if (!origin) return callback(null, true);
-    // In development, allow any localhost origin (Flutter uses random high ports)
-    if (isDev && (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1'))) {
+    // Always allow localhost (Flutter dev uses random high ports)
+    if (origin.startsWith('http://localhost') || origin.startsWith('http://127.0.0.1')) {
       return callback(null, true);
     }
     // In production, require an explicit match in ALLOWED_ORIGINS
