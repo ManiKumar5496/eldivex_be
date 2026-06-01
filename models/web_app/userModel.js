@@ -1,44 +1,38 @@
 const db = require('../../config/db');
 
 
-async function upsertUserToken (phone_number, token) {
+// Finds or creates a client user scoped to a specific organisation.
+// Token is NOT stored here — the controller generates it after getting the userId,
+// then calls a separate update. org_id is required.
+async function upsertUserToken(phone_number, org_id) {
   const existingUser = await db("edx_client_app_users")
     .select("id")
     .where("phone_number", phone_number)
+    .andWhere("org_id", org_id)
     .first();
 
   if (existingUser) {
-    // 🔥 UPDATE TOKEN
-    await db("edx_client_app_users")
-      .where("id", existingUser.id)
-      .update({
-        user_token: token,
-        updated_on: db.fn.now()
-      });
-
     return {
       success: true,
-      isNewUser: false,     // 🔥 Existing user
-      userId: existingUser.id
+      isNewUser: false,
+      userId: existingUser.id,
     };
   } else {
-    // 🆕 INSERT NEW USER
-    const [newId] = await db("edx_client_app_users")
-      .insert({
-        phone_number,
-        user_token: token,
-        status: 1,
-        is_new_user_flag:1,
-        created_on: db.fn.now()
-      });
+    const [newId] = await db("edx_client_app_users").insert({
+      phone_number,
+      status: 1,
+      is_new_user_flag: 1,
+      org_id,
+      created_on: db.fn.now(),
+    });
 
     return {
       success: true,
-      isNewUser: true,      // 🆕 New user
-      userId: newId
+      isNewUser: true,
+      userId: newId,
     };
   }
-};
+}
 
 
 

@@ -116,6 +116,10 @@ app.use('/api', auditRoutes);
 const reportsRoutes = require('./routes/reportsRoutes');
 app.use('/api', reportsRoutes);
 
+// ── Lead capture — public, no auth ───────────────────────────────────────────
+const leadsRoutes = require('./routes/leadsRoutes');
+app.use('/api', leadsRoutes);
+
 // ── Phase 4.3 — Weekly report cron ───────────────────────────────────────────
 const { startWeeklyReportCron } = require('./cron/weeklyReport');
 startWeeklyReportCron();

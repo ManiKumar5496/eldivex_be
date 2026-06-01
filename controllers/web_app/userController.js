@@ -164,25 +164,47 @@ const saveUser = async (req, res) => {
 
 
 const loginUsers = async (req, res) => {
-  const { phone_number } = req.body;
+  const { phone_number, org_id } = req.body;
 
-  if (!phone_number) {
-    return res.status(400).json({ message: "Phone number is required" });
-  }
+  if (!phone_number) return res.status(400).json({ message: "Phone number is required" });
+  if (!org_id) return res.status(400).json({ message: "Organization ID is required" });
+
+  const parsedOrgId = parseInt(org_id, 10);
+  if (isNaN(parsedOrgId)) return res.status(400).json({ message: "Organization ID must be a number" });
 
   try {
-    // Generate token without checking the DB
-    const token = generateToken({ phone_number });
+    // 1. Validate org exists and is active
+    const org = await db('edx_organizations')
+      .select('id', 'name', 'status')
+      .where({ id: parsedOrgId })
+      .first();
 
-    // Upsert user + get flag
-    const result = await getUsers.upsertUserToken(phone_number, token);
+    if (!org) return res.status(404).json({ message: "Organization not found" });
+    if (org.status !== 'active') return res.status(403).json({ message: "Organization account is not active" });
+
+    // 2. Find or create client user scoped to this org
+    const result = await getUsers.upsertUserToken(phone_number, parsedOrgId);
+
+    // 3. Generate JWT with the real user id and org scope
+    const token = generateToken({
+      id: result.userId,
+      user_role: null,
+      user_branch_access: null,
+      org_id: parsedOrgId,
+    });
+
+    // 4. Persist the token on the user record
+    await db('edx_client_app_users')
+      .where({ id: result.userId })
+      .update({ user_token: token, updated_on: db.fn.now() });
 
     return res.status(200).json({
-      message: "Token generated successfully",
+      message: "Login successful",
       token,
-      isNewUser: result.isNewUser,   // 🔥 Flag for new or existing user
+      isNewUser: result.isNewUser,
       userId: result.userId,
-      phone_number:phone_number          // optional but useful
+      org_id: parsedOrgId,
+      phone_number,
     });
 
   } catch (err) {
