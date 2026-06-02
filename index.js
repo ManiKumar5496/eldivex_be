@@ -8,6 +8,7 @@ const path    = require('path');
 const cors    = require('cors');
 
 const app = express();
+app.set('trust proxy', 1); // Required when running behind Render/load balancer
 const logger      = require('./logger');
 const errorHandler = require('./middlewares/errorHandler');
 const { authLimiter, generalLimiter } = require('./middlewares/rateLimiter');
