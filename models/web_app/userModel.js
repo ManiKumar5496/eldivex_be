@@ -41,24 +41,25 @@ async function upsertUserToken(phone_number, org_id) {
 
 async function getDetails (filters = {})
 {
-   const { user_id,phone_number } = filters;
+   const { user_id, phone_number, org_id } = filters;
 
- let query = db('edx_client_app_users')   
+ let query = db('edx_client_app_users')
    .select('*')
    .where('status','1');
     // console.log(query.toString());
     if (user_id) query.where('edx_client_app_users.id', user_id);
     if (phone_number) query.where('edx_client_app_users.phone_number', phone_number);
-    
+    if (org_id) query.where('edx_client_app_users.org_id', org_id);
+
 
  return query;
 };
 
 async function getWebEmpDetailsModel (filters = {})
 {
-   const { id,user_mobile,user_role } = filters;
+   const { id, user_mobile, user_role, org_id } = filters;
 
- let query = db('edx_web_app_users')   
+ let query = db('edx_web_app_users')
    .select('*')
    .where('user_status','1')
    .leftJoin('edx_web_emp_roles','edx_web_emp_roles.id','edx_web_app_users.user_role')
@@ -66,7 +67,8 @@ async function getWebEmpDetailsModel (filters = {})
     if (id) query.where('edx_web_app_users.id', id);
     if (user_mobile) query.where('edx_web_app_users.user_mobile', user_mobile);
     if (user_role) query.where('edx_web_app_users.user_role', user_role);
-    
+    if (org_id) query.where('edx_web_app_users.org_id', org_id);
+
 
  return query;
 };
