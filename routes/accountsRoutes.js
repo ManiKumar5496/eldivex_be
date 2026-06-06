@@ -52,4 +52,21 @@ router.get('/getRevenueRecognition',  auth, ac.getRevenueRecognition);
 // ── Phase C — Rate History ────────────────────────────────────────────────────
 router.get('/getRateHistory',         auth, ac.getRateHistory);
 
+// ── Phase 2.4 Extension — Transaction Ledger, Write-Off V2, Refund,
+//    Credit Note Application, Internal Transfer  (Added 2026-06-06) ──────────
+router.get('/transactionLedger',                auth, ac.getTransactionLedger);
+router.get('/clientOutstanding/:clientId',      auth, ac.getClientOutstanding);
+router.get('/bookingOutstanding/:bookingId',    auth, ac.getBookingOutstanding);
+router.post('/createWriteOffV2',               auth, ac.createWriteOffV2);
+router.patch('/approveWriteOff',               auth, ac.approveWriteOff);
+router.post('/createRefund',                   auth, ac.createRefund);
+router.get('/getRefunds',                      auth, ac.getRefunds);
+router.get('/getRefundById/:id',               auth, ac.getRefundById);
+router.patch('/approveRefund',                 auth, ac.approveRefund);
+router.post('/applyCreditNote',                auth, ac.applyCreditNote);
+router.get('/getCreditNoteApplications',       auth, ac.getCreditNoteApplications);
+router.post('/createInternalTransfer',         auth, ac.createInternalTransfer);
+router.get('/getInternalTransfers',            auth, ac.getInternalTransfers);
+router.patch('/approveInternalTransfer',       auth, ac.approveInternalTransfer);
+
 module.exports = router;

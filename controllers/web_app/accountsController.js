@@ -2,7 +2,7 @@
  * accountsController.js — Phase 2.4 + Advanced Accounts
  *
  * Tables used:
- *   edx_bookings, edx_web_app_users, edx_patient, edx_master_services,
+ *   edx_bookings, edx_client_app_users, edx_web_app_users, edx_patient, edx_master_services,
  *   edx_branches, edx_invoice, edx_receipts, edx_write_offs,
  *   edx_credit_notes, edx_insurance_claims, edx_period_closing,
  *   edx_payment_reminders, edx_payment_links, edx_rate_history
@@ -13,6 +13,7 @@ const logger = require('../../logger');
 const applyBranchFilter = require('../../utils/applyBranchFilter');
 const { getCurrentDateTime, toMysqlDate } = require('../../utils/dateTime');
 const { withOrg, orgQuery, getOrgId } = require('../../utils/orgScope');
+const withTransaction = require('../../utils/withTransaction');
 const { sendEmail } = require('../../utils/emailService');
 const { paymentReminder, creditNoteGenerated } = require('../../utils/emailTemplates');
 
@@ -31,7 +32,7 @@ const getActiveClients = async (req, res) => {
     // Use db('table as alias').where() directly for aliased main table queries.
     let query = db('edx_bookings as b')
       .where('b.org_id', getOrgId(req))
-      .leftJoin('edx_web_app_users as u', 'b.user_id', 'u.id')
+      .leftJoin('edx_client_app_users as u', 'b.user_id', 'u.id')
       .leftJoin('edx_patient as p',         'b.patient_id', 'p.id')
       .leftJoin('edx_master_services as ms', 'b.service_type_id', 'ms.id')
       .leftJoin('edx_branches as br',        'b.branch_id', 'br.br_id')
@@ -53,6 +54,7 @@ const getActiveClients = async (req, res) => {
         'rec.booking_id', 'b.id'
       )
       .select(
+        'b.id',
         'b.id as booking_id',
         'b.user_id',
         'b.branch_id',
@@ -62,7 +64,7 @@ const getActiveClients = async (req, res) => {
         'b.final_rate',
         'b.status',
         'u.user_name as client_name',
-        'u.user_mobile as client_mobile',
+        'u.phone_number as client_mobile',
         'u.user_email as client_email',
         'p.patient_name',
         'ms.name as service_name',
@@ -153,7 +155,7 @@ const createProvisionalReceipt = async (req, res) => {
 
     // Generate receipt_number before insert using current org count
     const countRow = await db('edx_receipts').where({ org_id: orgId }).count('id as cnt').first();
-    const receipt_number = `RCP-${String((Number(countRow.cnt) || 0) + 1).padStart(6, '0')}`;
+    const receipt_number = `RCP-${orgId}-${String((Number(countRow.cnt) || 0) + 1).padStart(6, '0')}`;
 
     // Record payment directly as Approved — no provisional/pending step needed
     const [id] = await db('edx_receipts').insert(withOrg(req, {
@@ -449,7 +451,7 @@ const getInvoices = async (req, res) => {
 
     let query = db('edx_invoice as i')
       .leftJoin('edx_bookings as b',        'i.booking_id', 'b.id')
-      .leftJoin('edx_web_app_users as u',   'b.user_id', 'u.id')
+      .leftJoin('edx_client_app_users as u',   'b.user_id', 'u.id')
       .leftJoin('edx_patient as p',         'b.patient_id', 'p.id')
       .leftJoin('edx_master_services as ms','b.service_type_id', 'ms.id')
       .leftJoin('edx_branches as br',       'b.branch_id', 'br.br_id')
@@ -478,7 +480,7 @@ const getInvoices = async (req, res) => {
         'b.final_rate as daily_rate',
         'b.status    as booking_status',
         'u.user_name   as client_name',
-        'u.user_mobile as client_mobile',
+        'u.phone_number as client_mobile',
         'p.patient_name',
         'ms.name as service_name',
         'br.br_name as branch_name',
@@ -558,7 +560,7 @@ const createCreditNote = async (req, res) => {
     setImmediate(async () => {
       try {
         const booking = await db('edx_bookings as b')
-          .leftJoin('edx_web_app_users as u', 'b.user_id', 'u.id')
+          .leftJoin('edx_client_app_users as u', 'b.user_id', 'u.id')
           .where('b.id', booking_id)
           .select('u.user_email', 'u.user_name')
           .first();
@@ -592,13 +594,13 @@ const getCreditNotes = async (req, res) => {
   try {
     let query = db('edx_credit_notes as cn')
       .leftJoin('edx_bookings as b',       'cn.booking_id', 'b.id')
-      .leftJoin('edx_web_app_users as u',  'b.user_id', 'u.id')
+      .leftJoin('edx_client_app_users as u',  'b.user_id', 'u.id')
       .leftJoin('edx_patient as p',        'b.patient_id', 'p.id')
       .where('cn.org_id', getOrgId(req))
       .select(
         'cn.*',
         'u.user_name  as client_name',
-        'u.user_mobile as client_mobile',
+        'u.phone_number as client_mobile',
         'p.patient_name',
       )
       .orderBy('cn.id', 'desc');
@@ -1114,13 +1116,13 @@ const getInsuranceClaims = async (req, res) => {
   try {
     let query = db('edx_insurance_claims as ic')
       .leftJoin('edx_bookings as b',       'ic.booking_id', 'b.id')
-      .leftJoin('edx_web_app_users as u',  'b.user_id', 'u.id')
+      .leftJoin('edx_client_app_users as u',  'b.user_id', 'u.id')
       .leftJoin('edx_patient as p',        'b.patient_id', 'p.id')
       .where('ic.org_id', getOrgId(req))
       .select(
         'ic.*',
         'u.user_name   as client_name',
-        'u.user_mobile as client_mobile',
+        'u.phone_number as client_mobile',
         'p.patient_name',
       )
       .orderBy('ic.id', 'desc');
@@ -1149,7 +1151,7 @@ const getCancellationBilling = async (req, res) => {
     if (!booking_id) return res.status(400).json({ message: 'booking_id is required.' });
 
     const booking = await db('edx_bookings as b')
-      .leftJoin('edx_web_app_users as u', 'b.user_id', 'u.id')
+      .leftJoin('edx_client_app_users as u', 'b.user_id', 'u.id')
       .leftJoin('edx_patient as p',       'b.patient_id', 'p.id')
       .leftJoin('edx_master_services as ms', 'b.service_type_id', 'ms.id')
       .where('b.id', booking_id)
@@ -1157,7 +1159,7 @@ const getCancellationBilling = async (req, res) => {
       .select(
         'b.*',
         'u.user_name   as client_name',
-        'u.user_mobile as client_mobile',
+        'u.phone_number as client_mobile',
         'p.patient_name',
         'ms.name as service_name',
       )
@@ -1241,9 +1243,9 @@ const createPaymentLink = async (req, res) => {
         // Fetch invoice details for description
         const inv = await db('edx_invoice as i')
           .leftJoin('edx_bookings as b', 'i.booking_id', 'b.id')
-          .leftJoin('edx_web_app_users as u', 'b.user_id', 'u.id')
+          .leftJoin('edx_client_app_users as u', 'b.user_id', 'u.id')
           .where('i.id', invoice_id)
-          .select('u.user_name', 'u.user_mobile', 'u.user_email', 'i.booking_id')
+          .select('u.user_name', 'u.phone_number as user_mobile', 'u.user_email', 'i.booking_id')
           .first();
 
         const payLink = await rzp.paymentLink.create({
@@ -1397,7 +1399,7 @@ const getReceipts = async (req, res) => {
   try {
     let query = db('edx_receipts as r')
       .leftJoin('edx_bookings as b',       'r.booking_id', 'b.id')
-      .leftJoin('edx_web_app_users as u',  'b.user_id', 'u.id')
+      .leftJoin('edx_client_app_users as u',  'b.user_id', 'u.id')
       .leftJoin('edx_patient as p',        'b.patient_id', 'p.id')
       .leftJoin('edx_master_services as ms','b.service_type_id', 'ms.id')
       .where('r.org_id', getOrgId(req))
@@ -1405,7 +1407,7 @@ const getReceipts = async (req, res) => {
         'r.*',
         db.raw("CONCAT('REC-', r.id) as receipt_number"),
         'u.user_name   as client_name',
-        'u.user_mobile as client_mobile',
+        'u.phone_number as client_mobile',
         'p.patient_name',
         'ms.name as service_name',
       )
@@ -1435,14 +1437,14 @@ const getWriteOffs = async (req, res) => {
   try {
     let query = db('edx_write_offs as wo')
       .leftJoin('edx_bookings as b',       'wo.booking_id', 'b.id')
-      .leftJoin('edx_web_app_users as u',  'b.user_id', 'u.id')
+      .leftJoin('edx_client_app_users as u',  'b.user_id', 'u.id')
       .leftJoin('edx_patient as p',        'b.patient_id', 'p.id')
       .leftJoin('edx_master_services as ms','b.service_type_id', 'ms.id')
       .where('wo.org_id', getOrgId(req))
       .select(
         'wo.*',
         'u.user_name   as client_name',
-        'u.user_mobile as client_mobile',
+        'u.phone_number as client_mobile',
         'p.patient_name',
         'ms.name as service_name',
       )
@@ -1458,6 +1460,673 @@ const getWriteOffs = async (req, res) => {
   } catch (err) {
     logger.error(`Error getWriteOffs: ${err.message}`);
     res.status(500).json({ error: 'An error occurred while fetching write-offs.' });
+  }
+};
+
+// ════════════════════════════════════════════════════════════════════
+// PHASE 2.4 EXTENSION — Transaction Ledger, Write-Off V2, Refund,
+// Credit Note Application, Internal Transfer  (Added 2026-06-06)
+// ════════════════════════════════════════════════════════════════════
+
+// ── Internal Helpers ─────────────────────────────────────────────────────────
+
+async function _createTransactionEntry(trxOrDb, { orgId, clientId, bookingId, invoiceId, transactionType, direction, amount, referenceId, referenceType, description, notes, createdBy }) {
+  const clientRows = await trxOrDb('edx_transaction_ledger')
+    .where({ org_id: orgId, client_id: clientId, status: 'COMPLETED' })
+    .sum({ total_debit: trxOrDb.raw('CASE WHEN direction="DEBIT" THEN amount ELSE 0 END') })
+    .sum({ total_credit: trxOrDb.raw('CASE WHEN direction="CREDIT" THEN amount ELSE 0 END') })
+    .first();
+  const prevClientBalance = (parseFloat(clientRows.total_debit) || 0) - (parseFloat(clientRows.total_credit) || 0);
+  const newClientBalance = direction === 'DEBIT' ? prevClientBalance + amount : prevClientBalance - amount;
+
+  let newBookingBalance = null;
+  if (bookingId) {
+    const bkRows = await trxOrDb('edx_transaction_ledger')
+      .where({ org_id: orgId, booking_id: bookingId, status: 'COMPLETED' })
+      .sum({ total_debit: trxOrDb.raw('CASE WHEN direction="DEBIT" THEN amount ELSE 0 END') })
+      .sum({ total_credit: trxOrDb.raw('CASE WHEN direction="CREDIT" THEN amount ELSE 0 END') })
+      .first();
+    const prevBkBalance = (parseFloat(bkRows.total_debit) || 0) - (parseFloat(bkRows.total_credit) || 0);
+    newBookingBalance = direction === 'DEBIT' ? prevBkBalance + amount : prevBkBalance - amount;
+  }
+
+  const [id] = await trxOrDb('edx_transaction_ledger').insert({
+    org_id: orgId,
+    client_id: clientId,
+    booking_id: bookingId || null,
+    invoice_id: invoiceId || null,
+    transaction_type: transactionType,
+    direction,
+    amount,
+    reference_id: referenceId || null,
+    reference_type: referenceType || null,
+    status: 'COMPLETED',
+    description: description || null,
+    notes: notes || null,
+    running_balance_client: newClientBalance,
+    running_balance_booking: newBookingBalance,
+    created_by: createdBy || null,
+    created_on: getCurrentDateTime(),
+  });
+  return id;
+}
+
+function _determineApprovalLevel(amount) {
+  if (amount <= 500) return 'L1';
+  if (amount <= 5000) return 'L2';
+  return 'L3';
+}
+
+async function _addApprovalHistory(trxOrDb, { orgId, referenceType, referenceId, action, actionBy, notes, approvalLevel }) {
+  await trxOrDb('edx_approval_history').insert({
+    org_id: orgId,
+    reference_type: referenceType,
+    reference_id: referenceId,
+    action,
+    action_by: actionBy,
+    notes: notes || null,
+    approval_level: approvalLevel || null,
+    action_on: getCurrentDateTime(),
+  });
+}
+
+// ── getTransactionLedger ─────────────────────────────────────────────────────
+
+const getTransactionLedger = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const { booking_id, client_id, from_date, to_date, limit = 100, offset = 0 } = req.query;
+    let q = db('edx_transaction_ledger as tl')
+      .leftJoin('edx_web_app_users as u', 'u.id', 'tl.created_by')
+      .where('tl.org_id', orgId)
+      .select(
+        'tl.*',
+        db.raw("CONCAT(IFNULL(u.first_name,''), ' ', IFNULL(u.last_name,'')) as created_by_name")
+      )
+      .orderBy('tl.id', 'desc')
+      .limit(parseInt(limit))
+      .offset(parseInt(offset));
+    if (booking_id) q = q.where('tl.booking_id', booking_id);
+    if (client_id) q = q.where('tl.client_id', client_id);
+    if (from_date) q = q.where('tl.created_on', '>=', from_date);
+    if (to_date) q = q.where('tl.created_on', '<=', to_date + ' 23:59:59');
+    const data = await q;
+    const countQ = db('edx_transaction_ledger').where('org_id', orgId);
+    if (booking_id) countQ.where('booking_id', booking_id);
+    if (client_id) countQ.where('client_id', client_id);
+    const [{ total }] = await countQ.count('id as total');
+    return res.json({ data, total, limit: parseInt(limit), offset: parseInt(offset) });
+  } catch (err) {
+    console.error('getTransactionLedger error', err);
+    return res.status(500).json({ error: 'Failed to fetch transaction ledger' });
+  }
+};
+
+// ── getClientOutstanding ─────────────────────────────────────────────────────
+
+const getClientOutstanding = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const { clientId } = req.params;
+    const rows = await db('edx_transaction_ledger')
+      .where({ org_id: orgId, client_id: clientId, status: 'COMPLETED' })
+      .select(
+        'transaction_type',
+        'direction',
+        db.raw('SUM(amount) as total')
+      )
+      .groupBy('transaction_type', 'direction');
+
+    const totals = {};
+    rows.forEach(r => {
+      totals[r.transaction_type] = (totals[r.transaction_type] || 0) + parseFloat(r.total);
+    });
+
+    const totalBilled = totals['INVOICE'] || 0;
+    const totalPaid = totals['RECEIPT'] || 0;
+    const totalWriteOff = totals['WRITE_OFF'] || 0;
+    const totalCreditNoteApplied = totals['CREDIT_NOTE_APPLIED'] || 0;
+    const totalRefunded = totals['REFUND'] || 0;
+    const totalTransferIn = totals['INTERNAL_TRANSFER_IN'] || 0;
+    const totalTransferOut = totals['INTERNAL_TRANSFER_OUT'] || 0;
+    const outstandingAmount = totalBilled - totalPaid - totalWriteOff - totalCreditNoteApplied - totalTransferIn + totalTransferOut + totalRefunded;
+
+    return res.json({
+      clientId: parseInt(clientId),
+      totalBilled,
+      totalPaid,
+      totalWriteOff,
+      totalCreditNoteApplied,
+      totalRefunded,
+      totalInternalTransferIn: totalTransferIn,
+      totalInternalTransferOut: totalTransferOut,
+      outstandingAmount,
+    });
+  } catch (err) {
+    console.error('getClientOutstanding error', err);
+    return res.status(500).json({ error: 'Failed to compute outstanding' });
+  }
+};
+
+// ── getBookingOutstanding ────────────────────────────────────────────────────
+
+const getBookingOutstanding = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const { bookingId } = req.params;
+    const rows = await db('edx_transaction_ledger')
+      .where({ org_id: orgId, booking_id: bookingId, status: 'COMPLETED' })
+      .select('transaction_type', 'direction', db.raw('SUM(amount) as total'))
+      .groupBy('transaction_type', 'direction');
+
+    const totals = {};
+    rows.forEach(r => { totals[r.transaction_type] = (totals[r.transaction_type] || 0) + parseFloat(r.total); });
+
+    const totalBilled = totals['INVOICE'] || 0;
+    const totalPaid = totals['RECEIPT'] || 0;
+    const totalWriteOff = totals['WRITE_OFF'] || 0;
+    const totalCreditNoteApplied = totals['CREDIT_NOTE_APPLIED'] || 0;
+    const totalRefunded = totals['REFUND'] || 0;
+    const totalTransferIn = totals['INTERNAL_TRANSFER_IN'] || 0;
+    const totalTransferOut = totals['INTERNAL_TRANSFER_OUT'] || 0;
+    const outstandingAmount = totalBilled - totalPaid - totalWriteOff - totalCreditNoteApplied - totalTransferIn + totalTransferOut + totalRefunded;
+
+    return res.json({
+      bookingId: parseInt(bookingId),
+      totalBilled, totalPaid, totalWriteOff, totalCreditNoteApplied,
+      totalRefunded, totalInternalTransferIn: totalTransferIn, totalInternalTransferOut: totalTransferOut,
+      outstandingAmount,
+    });
+  } catch (err) {
+    console.error('getBookingOutstanding error', err);
+    return res.status(500).json({ error: 'Failed to compute booking outstanding' });
+  }
+};
+
+// ── createWriteOffV2 ─────────────────────────────────────────────────────────
+
+const createWriteOffV2 = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const userId = req.login_data.id;
+    const { booking_id, user_id, write_off_type = 'BAD_DEBT', invoice_ids = [], write_off_amount, reason, remarks } = req.body;
+
+    if (!booking_id || !write_off_amount || !reason) return res.status(400).json({ error: 'booking_id, write_off_amount and reason are required' });
+    const amount = parseFloat(write_off_amount);
+    if (isNaN(amount) || amount <= 0) return res.status(400).json({ error: 'write_off_amount must be a positive number' });
+
+    const booking = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first();
+    if (!booking) return res.status(404).json({ error: 'Booking not found' });
+    if (booking.status == 6) return res.status(400).json({ error: 'Cannot write off a cancelled booking' });
+
+    const existing = await db('edx_write_offs').where({ booking_id, org_id: orgId, status: 'Pending' }).first();
+    if (existing) return res.status(400).json({ error: 'A pending write-off already exists for this booking' });
+
+    const approvalLevel = _determineApprovalLevel(amount);
+    const now = getCurrentDateTime();
+
+    const [id] = await db('edx_write_offs').insert(withOrg(req, {
+      booking_id,
+      user_id: user_id || booking.user_id,
+      write_off_amount: amount,
+      write_off_type,
+      invoice_ids: JSON.stringify(invoice_ids),
+      reason,
+      remarks: remarks || null,
+      approval_level: approvalLevel,
+      status: 'Pending',
+      write_off_date: now,
+      created_by: userId,
+      created_on: now,
+      updated_by: userId,
+      updated_on: now,
+    }));
+
+    await _addApprovalHistory(db, {
+      orgId, referenceType: 'WRITE_OFF', referenceId: id,
+      action: 'SUBMITTED', actionBy: userId,
+      approvalLevel: approvalLevel === 'L1' ? 1 : approvalLevel === 'L2' ? 2 : 3,
+    });
+
+    const created = await db('edx_write_offs').where('id', id).first();
+    return res.json(created);
+  } catch (err) {
+    console.error('createWriteOffV2 error', err);
+    return res.status(500).json({ error: 'Failed to create write-off' });
+  }
+};
+
+// ── approveWriteOff ──────────────────────────────────────────────────────────
+
+const approveWriteOff = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const userId = req.login_data.id;
+    const { write_off_id, action, notes } = req.body;
+    if (!write_off_id || !action) return res.status(400).json({ error: 'write_off_id and action required' });
+    if (!['Approved', 'Rejected'].includes(action)) return res.status(400).json({ error: 'action must be Approved or Rejected' });
+
+    const wo = await db('edx_write_offs').where({ id: write_off_id, org_id: orgId }).first();
+    if (!wo) return res.status(404).json({ error: 'Write-off not found' });
+    if (wo.status !== 'Pending') return res.status(400).json({ error: 'Only Pending write-offs can be approved or rejected' });
+
+    const now = getCurrentDateTime();
+
+    if (action === 'Approved') {
+      await withTransaction(async (trx) => {
+        const booking = await trx('edx_bookings').where('id', wo.booking_id).first();
+        const entryId = await _createTransactionEntry(trx, {
+          orgId, clientId: wo.user_id || booking.user_id, bookingId: wo.booking_id,
+          transactionType: 'WRITE_OFF', direction: 'CREDIT',
+          amount: parseFloat(wo.write_off_amount),
+          referenceId: wo.id, referenceType: 'WRITE_OFF',
+          description: 'Write-off approved: ' + wo.reason,
+          createdBy: userId,
+        });
+        await trx('edx_write_offs').where('id', wo.id).update({
+          status: 'Approved', approved_by: String(userId),
+          transaction_entry_id: entryId, updated_by: userId, updated_on: now,
+        });
+        await _addApprovalHistory(trx, {
+          orgId, referenceType: 'WRITE_OFF', referenceId: wo.id,
+          action: 'APPROVED', actionBy: userId, notes,
+          approvalLevel: wo.approval_level === 'L1' ? 1 : wo.approval_level === 'L2' ? 2 : 3,
+        });
+      });
+    } else {
+      await db('edx_write_offs').where('id', wo.id).update({ status: 'Rejected', updated_by: userId, updated_on: now });
+      await _addApprovalHistory(db, {
+        orgId, referenceType: 'WRITE_OFF', referenceId: wo.id, action: 'REJECTED', actionBy: userId, notes,
+      });
+    }
+
+    const updated = await db('edx_write_offs').where('id', wo.id).first();
+    const history = await db('edx_approval_history').where({ reference_type: 'WRITE_OFF', reference_id: wo.id, org_id: orgId }).orderBy('id');
+    return res.json({ ...updated, approval_history: history });
+  } catch (err) {
+    console.error('approveWriteOff error', err);
+    return res.status(500).json({ error: 'Failed to update write-off status' });
+  }
+};
+
+// ── createRefund ─────────────────────────────────────────────────────────────
+
+const createRefund = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const userId = req.login_data.id;
+    const { booking_id, client_id, invoice_id, receipt_ids = [], refund_amount, refund_channel, refund_reason, channel_details = {}, notes } = req.body;
+
+    if (!booking_id || !refund_amount || !refund_channel || !refund_reason) {
+      return res.status(400).json({ error: 'booking_id, refund_amount, refund_channel, refund_reason are required' });
+    }
+    const amount = parseFloat(refund_amount);
+    if (isNaN(amount) || amount <= 0) return res.status(400).json({ error: 'refund_amount must be positive' });
+
+    const booking = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first();
+    if (!booking) return res.status(404).json({ error: 'Booking not found' });
+
+    const paidRows = await db('edx_receipts').where({ booking_id, org_id: orgId, status: 'Approved' }).sum('total_amount as total').first();
+    const alreadyRefunded = await db('edx_refunds').where({ booking_id, org_id: orgId }).whereIn('status', ['APPROVED', 'PROCESSING', 'COMPLETED']).sum('refund_amount as total').first();
+    const maxRefund = (parseFloat(paidRows?.total) || 0) - (parseFloat(alreadyRefunded?.total) || 0);
+    if (amount > maxRefund) return res.status(400).json({ error: 'Refund amount exceeds refundable balance of ' + maxRefund });
+
+    const approvalLevel = _determineApprovalLevel(amount);
+    const now = getCurrentDateTime();
+
+    const [id] = await db('edx_refunds').insert(withOrg(req, {
+      client_id: client_id || booking.user_id,
+      booking_id,
+      invoice_id: invoice_id || null,
+      receipt_ids: JSON.stringify(receipt_ids),
+      refund_amount: amount,
+      refund_channel,
+      refund_reason,
+      channel_details: JSON.stringify(channel_details),
+      status: 'PENDING_APPROVAL',
+      approval_level: approvalLevel,
+      requested_by: userId,
+      notes: notes || null,
+      created_by: userId,
+      created_on: now,
+      updated_by: userId,
+      updated_on: now,
+    }));
+
+    await _addApprovalHistory(db, {
+      orgId, referenceType: 'REFUND', referenceId: id, action: 'SUBMITTED', actionBy: userId,
+      approvalLevel: approvalLevel === 'L1' ? 1 : approvalLevel === 'L2' ? 2 : 3,
+    });
+
+    const created = await db('edx_refunds').where('id', id).first();
+    return res.json(created);
+  } catch (err) {
+    console.error('createRefund error', err);
+    return res.status(500).json({ error: 'Failed to create refund' });
+  }
+};
+
+// ── getRefunds ───────────────────────────────────────────────────────────────
+
+const getRefunds = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const { booking_id, status, from_date, to_date } = req.query;
+    let q = db('edx_refunds as r')
+      .leftJoin('edx_bookings as b', 'b.id', 'r.booking_id')
+      .leftJoin('edx_client_app_users as u', 'u.id', 'r.client_id')
+      .where('r.org_id', orgId)
+      .select('r.*',
+        db.raw("CONCAT(IFNULL(u.first_name,''), ' ', IFNULL(u.last_name,'')) as client_name"),
+        db.raw("CONCAT('BK-', LPAD(b.id, 6, '0')) as booking_ref")
+      )
+      .orderBy('r.id', 'desc');
+    if (booking_id) q = q.where('r.booking_id', booking_id);
+    if (status) q = q.where('r.status', status);
+    if (from_date) q = q.where('r.created_on', '>=', from_date);
+    if (to_date) q = q.where('r.created_on', '<=', to_date + ' 23:59:59');
+    const data = await q;
+    return res.json(data);
+  } catch (err) {
+    console.error('getRefunds error', err);
+    return res.status(500).json({ error: 'Failed to fetch refunds' });
+  }
+};
+
+// ── getRefundById ────────────────────────────────────────────────────────────
+
+const getRefundById = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const { id } = req.params;
+    const refund = await db('edx_refunds as r')
+      .leftJoin('edx_bookings as b', 'b.id', 'r.booking_id')
+      .leftJoin('edx_client_app_users as u', 'u.id', 'r.client_id')
+      .where('r.id', id).where('r.org_id', orgId)
+      .select('r.*',
+        db.raw("CONCAT(IFNULL(u.first_name,''), ' ', IFNULL(u.last_name,'')) as client_name"),
+        db.raw("CONCAT('BK-', LPAD(b.id, 6, '0')) as booking_ref")
+      ).first();
+    if (!refund) return res.status(404).json({ error: 'Refund not found' });
+    const history = await db('edx_approval_history').where({ reference_type: 'REFUND', reference_id: id, org_id: orgId }).orderBy('id');
+    return res.json({ ...refund, approval_history: history });
+  } catch (err) {
+    console.error('getRefundById error', err);
+    return res.status(500).json({ error: 'Failed to fetch refund' });
+  }
+};
+
+// ── approveRefund ────────────────────────────────────────────────────────────
+
+const approveRefund = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const userId = req.login_data.id;
+    const { refund_id, action, notes, dispatch_details } = req.body;
+    if (!refund_id || !action) return res.status(400).json({ error: 'refund_id and action required' });
+
+    const refund = await db('edx_refunds').where({ id: refund_id, org_id: orgId }).first();
+    if (!refund) return res.status(404).json({ error: 'Refund not found' });
+
+    const now = getCurrentDateTime();
+    const allowed = { PENDING_APPROVAL: ['Approved', 'Rejected'], APPROVED: ['Processing'], PROCESSING: ['Completed'] };
+    if (!allowed[refund.status]?.includes(action)) {
+      return res.status(400).json({ error: 'Invalid status transition: ' + refund.status + ' → ' + action });
+    }
+
+    const updates = { updated_by: userId, updated_on: now };
+    let historyAction = action === 'Approved' ? 'APPROVED' : action === 'Rejected' ? 'REJECTED' : 'APPROVED';
+
+    if (action === 'Approved') {
+      Object.assign(updates, { status: 'APPROVED', approved_by: userId, approved_at: now });
+    } else if (action === 'Rejected') {
+      Object.assign(updates, { status: 'REJECTED' });
+      historyAction = 'REJECTED';
+    } else if (action === 'Processing') {
+      Object.assign(updates, { status: 'PROCESSING', processed_by: userId });
+    } else if (action === 'Completed') {
+      await withTransaction(async (trx) => {
+        const entryId = await _createTransactionEntry(trx, {
+          orgId, clientId: refund.client_id, bookingId: refund.booking_id,
+          transactionType: 'REFUND', direction: 'DEBIT',
+          amount: parseFloat(refund.refund_amount),
+          referenceId: refund.id, referenceType: 'REFUND',
+          description: 'Refund processed: ' + refund.refund_reason,
+          createdBy: userId,
+        });
+        Object.assign(updates, {
+          status: 'COMPLETED', processed_by: userId, processed_at: now,
+          transaction_entry_id: entryId,
+          dispatch_details: dispatch_details ? JSON.stringify(dispatch_details) : refund.dispatch_details,
+        });
+        await trx('edx_refunds').where('id', refund.id).update(updates);
+        await _addApprovalHistory(trx, { orgId, referenceType: 'REFUND', referenceId: refund.id, action: 'APPROVED', actionBy: userId, notes });
+      });
+      const updated = await db('edx_refunds').where('id', refund.id).first();
+      const history = await db('edx_approval_history').where({ reference_type: 'REFUND', reference_id: refund.id, org_id: orgId }).orderBy('id');
+      return res.json({ ...updated, approval_history: history });
+    }
+
+    await db('edx_refunds').where('id', refund.id).update(updates);
+    await _addApprovalHistory(db, { orgId, referenceType: 'REFUND', referenceId: refund.id, action: historyAction, actionBy: userId, notes });
+    const updated = await db('edx_refunds').where('id', refund.id).first();
+    const history = await db('edx_approval_history').where({ reference_type: 'REFUND', reference_id: refund.id, org_id: orgId }).orderBy('id');
+    return res.json({ ...updated, approval_history: history });
+  } catch (err) {
+    console.error('approveRefund error', err);
+    return res.status(500).json({ error: 'Failed to update refund status' });
+  }
+};
+
+// ── applyCreditNote ──────────────────────────────────────────────────────────
+
+const applyCreditNote = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const userId = req.login_data.id;
+    const { credit_note_id, target_booking_id, target_invoice_id, amount_to_apply, notes } = req.body;
+    if (!credit_note_id || !target_booking_id || !target_invoice_id || !amount_to_apply) {
+      return res.status(400).json({ error: 'credit_note_id, target_booking_id, target_invoice_id, amount_to_apply required' });
+    }
+    const applyAmt = parseFloat(amount_to_apply);
+    const cn = await db('edx_credit_notes').where({ id: credit_note_id, org_id: orgId }).first();
+    if (!cn) return res.status(404).json({ error: 'Credit note not found' });
+    const remaining = parseFloat(cn.remaining_amount ?? cn.amount);
+    if (remaining < applyAmt) return res.status(400).json({ error: 'Amount exceeds credit note remaining balance of ' + remaining });
+    if (!['Approved'].includes(cn.status)) return res.status(400).json({ error: 'Credit note must be Approved to apply' });
+
+    const invoice = await db('edx_invoice').where({ id: target_invoice_id, org_id: orgId }).first();
+    if (!invoice) return res.status(404).json({ error: 'Target invoice not found' });
+
+    const targetBooking = await db('edx_bookings').where({ id: target_booking_id, org_id: orgId }).first();
+    if (!targetBooking) return res.status(404).json({ error: 'Target booking not found' });
+
+    let applicationId;
+    await withTransaction(async (trx) => {
+      const newRemaining = remaining - applyAmt;
+      const newUsed = (parseFloat(cn.used_amount) || 0) + applyAmt;
+      const extStatus = newRemaining <= 0 ? 'FULLY_APPLIED' : 'PARTIALLY_APPLIED';
+      await trx('edx_credit_notes').where('id', credit_note_id).update({
+        remaining_amount: newRemaining, used_amount: newUsed, extended_status: extStatus,
+        updated_on: getCurrentDateTime(), updated_by: userId,
+      });
+
+      const entryId = await _createTransactionEntry(trx, {
+        orgId, clientId: targetBooking.user_id, bookingId: target_booking_id,
+        invoiceId: target_invoice_id, transactionType: 'CREDIT_NOTE_APPLIED', direction: 'CREDIT',
+        amount: applyAmt, referenceId: credit_note_id, referenceType: 'CREDIT_NOTE',
+        description: 'Credit note applied to invoice #' + target_invoice_id,
+        createdBy: userId,
+      });
+
+      const [appId] = await trx('edx_credit_note_applications').insert({
+        org_id: orgId, credit_note_id, target_booking_id, target_invoice_id,
+        amount_applied: applyAmt, status: 'APPLIED',
+        applied_by: userId, applied_at: getCurrentDateTime(),
+        ledger_entry_id: entryId, notes: notes || null,
+      });
+      applicationId = appId;
+    });
+
+    const application = await db('edx_credit_note_applications').where('id', applicationId).first();
+    return res.json(application);
+  } catch (err) {
+    console.error('applyCreditNote error', err);
+    return res.status(500).json({ error: 'Failed to apply credit note' });
+  }
+};
+
+// ── getCreditNoteApplications ────────────────────────────────────────────────
+
+const getCreditNoteApplications = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const { credit_note_id, booking_id } = req.query;
+    let q = db('edx_credit_note_applications as a')
+      .leftJoin('edx_credit_notes as cn', 'cn.id', 'a.credit_note_id')
+      .leftJoin('edx_invoice as inv', 'inv.id', 'a.target_invoice_id')
+      .where('a.org_id', orgId)
+      .select('a.*',
+        db.raw("CONCAT('INV-', LPAD(inv.id, 6, '0')) as target_invoice_ref")
+      ).orderBy('a.id', 'desc');
+    if (credit_note_id) q = q.where('a.credit_note_id', credit_note_id);
+    if (booking_id) q = q.where('a.target_booking_id', booking_id);
+    const data = await q;
+    return res.json(data);
+  } catch (err) {
+    console.error('getCreditNoteApplications error', err);
+    return res.status(500).json({ error: 'Failed to fetch credit note applications' });
+  }
+};
+
+// ── createInternalTransfer ───────────────────────────────────────────────────
+
+const createInternalTransfer = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const userId = req.login_data.id;
+    const { client_id, source_booking_id, target_booking_id, transfer_amount, transfer_type, reason, notes } = req.body;
+    if (!client_id || !source_booking_id || !target_booking_id || !transfer_amount || !transfer_type || !reason) {
+      return res.status(400).json({ error: 'client_id, source_booking_id, target_booking_id, transfer_amount, transfer_type, reason are required' });
+    }
+    if (source_booking_id == target_booking_id) return res.status(400).json({ error: 'Source and target bookings must be different' });
+
+    const amount = parseFloat(transfer_amount);
+    if (isNaN(amount) || amount <= 0) return res.status(400).json({ error: 'transfer_amount must be positive' });
+
+    const [srcBk, tgtBk] = await Promise.all([
+      db('edx_bookings').where({ id: source_booking_id, org_id: orgId }).first(),
+      db('edx_bookings').where({ id: target_booking_id, org_id: orgId }).first(),
+    ]);
+    if (!srcBk) return res.status(404).json({ error: 'Source booking not found' });
+    if (!tgtBk) return res.status(404).json({ error: 'Target booking not found' });
+    if (srcBk.user_id != tgtBk.user_id) return res.status(400).json({ error: 'Both bookings must belong to the same client' });
+
+    const now = getCurrentDateTime();
+    const [id] = await db('edx_internal_transfers').insert(withOrg(req, {
+      client_id,
+      source_booking_id,
+      target_booking_id,
+      transfer_amount: amount,
+      transfer_type,
+      reason,
+      notes: notes || null,
+      status: 'PENDING_APPROVAL',
+      requested_by: userId,
+      created_by: userId,
+      created_on: now,
+      updated_by: userId,
+      updated_on: now,
+    }));
+
+    await _addApprovalHistory(db, { orgId, referenceType: 'INTERNAL_TRANSFER', referenceId: id, action: 'SUBMITTED', actionBy: userId, approvalLevel: 2 });
+
+    const created = await db('edx_internal_transfers').where('id', id).first();
+    return res.json(created);
+  } catch (err) {
+    console.error('createInternalTransfer error', err);
+    return res.status(500).json({ error: 'Failed to create internal transfer' });
+  }
+};
+
+// ── getInternalTransfers ─────────────────────────────────────────────────────
+
+const getInternalTransfers = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const { client_id, status } = req.query;
+    let q = db('edx_internal_transfers as t')
+      .leftJoin('edx_bookings as sb', 'sb.id', 't.source_booking_id')
+      .leftJoin('edx_bookings as tb', 'tb.id', 't.target_booking_id')
+      .leftJoin('edx_client_app_users as u', 'u.id', 't.client_id')
+      .where('t.org_id', orgId)
+      .select('t.*',
+        db.raw("CONCAT(IFNULL(u.first_name,''), ' ', IFNULL(u.last_name,'')) as client_name"),
+        db.raw("CONCAT('BK-', LPAD(sb.id, 6, '0')) as source_booking_ref"),
+        db.raw("CONCAT('BK-', LPAD(tb.id, 6, '0')) as target_booking_ref")
+      ).orderBy('t.id', 'desc');
+    if (client_id) q = q.where('t.client_id', client_id);
+    if (status) q = q.where('t.status', status);
+    const data = await q;
+    return res.json(data);
+  } catch (err) {
+    console.error('getInternalTransfers error', err);
+    return res.status(500).json({ error: 'Failed to fetch transfers' });
+  }
+};
+
+// ── approveInternalTransfer ──────────────────────────────────────────────────
+
+const approveInternalTransfer = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const userId = req.login_data.id;
+    const { transfer_id, action, notes } = req.body;
+    if (!transfer_id || !action) return res.status(400).json({ error: 'transfer_id and action required' });
+    if (!['Approved', 'Rejected'].includes(action)) return res.status(400).json({ error: 'action must be Approved or Rejected' });
+
+    const transfer = await db('edx_internal_transfers').where({ id: transfer_id, org_id: orgId }).first();
+    if (!transfer) return res.status(404).json({ error: 'Transfer not found' });
+    if (transfer.status !== 'PENDING_APPROVAL') return res.status(400).json({ error: 'Only PENDING_APPROVAL transfers can be actioned' });
+
+    const now = getCurrentDateTime();
+
+    if (action === 'Approved') {
+      await withTransaction(async (trx) => {
+        const outEntryId = await _createTransactionEntry(trx, {
+          orgId, clientId: transfer.client_id, bookingId: transfer.source_booking_id,
+          transactionType: 'INTERNAL_TRANSFER_OUT', direction: 'DEBIT',
+          amount: parseFloat(transfer.transfer_amount),
+          referenceId: transfer.id, referenceType: 'INTERNAL_TRANSFER',
+          description: 'Internal transfer out to booking #' + transfer.target_booking_id,
+          createdBy: userId,
+        });
+        const inEntryId = await _createTransactionEntry(trx, {
+          orgId, clientId: transfer.client_id, bookingId: transfer.target_booking_id,
+          transactionType: 'INTERNAL_TRANSFER_IN', direction: 'CREDIT',
+          amount: parseFloat(transfer.transfer_amount),
+          referenceId: transfer.id, referenceType: 'INTERNAL_TRANSFER',
+          description: 'Internal transfer in from booking #' + transfer.source_booking_id,
+          createdBy: userId,
+        });
+        await trx('edx_internal_transfers').where('id', transfer.id).update({
+          status: 'COMPLETED', approved_by: userId, approved_at: now,
+          source_transaction_entry_id: outEntryId, target_transaction_entry_id: inEntryId,
+          updated_by: userId, updated_on: now,
+        });
+        await _addApprovalHistory(trx, { orgId, referenceType: 'INTERNAL_TRANSFER', referenceId: transfer.id, action: 'APPROVED', actionBy: userId, notes, approvalLevel: 2 });
+      });
+    } else {
+      await db('edx_internal_transfers').where('id', transfer.id).update({ status: 'REJECTED', updated_by: userId, updated_on: now });
+      await _addApprovalHistory(db, { orgId, referenceType: 'INTERNAL_TRANSFER', referenceId: transfer.id, action: 'REJECTED', actionBy: userId, notes, approvalLevel: 2 });
+    }
+
+    const updated = await db('edx_internal_transfers').where('id', transfer.id).first();
+    const history = await db('edx_approval_history').where({ reference_type: 'INTERNAL_TRANSFER', reference_id: transfer.id, org_id: orgId }).orderBy('id');
+    return res.json({ ...updated, approval_history: history });
+  } catch (err) {
+    console.error('approveInternalTransfer error', err);
+    return res.status(500).json({ error: 'Failed to update transfer status' });
   }
 };
 
@@ -1488,4 +2157,20 @@ module.exports = {
   getRateHistory,
   getReceipts,
   getWriteOffs,
+  // Phase 2.4 Extension
+  getTransactionLedger,
+  getClientOutstanding,
+  getBookingOutstanding,
+  createWriteOffV2,
+  approveWriteOff,
+  createRefund,
+  getRefunds,
+  getRefundById,
+  approveRefund,
+  applyCreditNote,
+  getCreditNoteApplications,
+  createInternalTransfer,
+  getInternalTransfers,
+  approveInternalTransfer,
 };
+

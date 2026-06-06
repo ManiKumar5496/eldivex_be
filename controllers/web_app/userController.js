@@ -315,7 +315,7 @@ const createUserWeb = async (req, res) => {
     if (err.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({ message: 'Email already exists.' });
     }
-    res.status(500).json({ message: 'Server error.' });
+    res.status(500).json({ message: err.message || 'Server error.' });
   }
 };
 const updateUserWeb = async (req, res) => {
@@ -372,6 +372,24 @@ const updateUserWeb = async (req, res) => {
   } catch (err) {
     logger.error(`Error updating user: ${err.message}`);
     console.error(err);
+    res.status(500).json({ message: err.message || 'Server error.' });
+  }
+};
+const terminateUserWeb = async (req, res) => {
+  try {
+    const { id } = req.body;
+    if (!id) return res.status(400).json({ message: 'User ID is required.' });
+
+    const updated = await db('edx_web_app_users')
+      .where({ id })
+      .andWhere('org_id', getOrgId(req))
+      .update({ user_status: 0, updated_on: getCurrentDateTime() });
+
+    if (!updated) return res.status(404).json({ message: 'User not found.' });
+
+    res.status(200).json({ message: 'User terminated successfully.' });
+  } catch (err) {
+    logger.error(`Error terminating user: ${err.message}`);
     res.status(500).json({ message: 'Server error.' });
   }
 };
@@ -549,6 +567,7 @@ module.exports = {
     loginWebUsers,
     createUserWeb,
     updateUserWeb,
+    terminateUserWeb,
     updateUserClient,
     getWebEmpDetails,
     forgotPassword,

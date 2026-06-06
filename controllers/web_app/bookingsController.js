@@ -725,33 +725,24 @@ else if (status == 5) {
   };
   const markAttendance = async (req, res) => {
     try {
-      const {
-        booking_id,
-        inv_id,
-        from_date,
-        att_details,
-        hp_id,
-      
-        
-      } = req.body;
+      const { booking_id, inv_id, from_date, att_details, hp_id } = req.body;
       const userId = req.login_data.id;
 
       await db('edx_hp_attendance').insert(withOrg(req, {
-        booking_id: booking_id || 'NA',
-        inv_id: inv_id || 'NA',
-        from_date: from_date || 'NA',
-        att_details: att_details || 'NA',
-        hp_id: hp_id || 'NA',
-        created_on: getCurrentDateTime(),
-        created_by: userId
+        booking_id:  parseInt(booking_id, 10) || 0,
+        inv_id:      inv_id ? parseInt(inv_id, 10) : null,
+        from_date:   from_date   || null,
+        att_details: att_details || null,
+        hp_id:       hp_id ? parseInt(hp_id, 10) : null,
+        created_on:  getCurrentDateTime(),
+        created_by:  userId,
       }));
-  
-  
+
       res.status(201).json({ message: 'Attendance marked successfully.' });
     } catch (err) {
       logger.error(`Error marking attendance: ${err.message}`);
       console.error(err);
-      res.status(500).json({ message: 'Error marking attendance.' });
+      res.status(500).json({ message: 'Error marking attendance.', error: err.message });
     }
   };
   const getAttendanceList = async (req, res) => {

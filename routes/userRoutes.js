@@ -22,6 +22,8 @@ router.put('/update-user', auth, upload.fields([
   { name: 'user_image', maxCount: 1 },
 ]), userController.updateUserWeb);
 
+router.put('/terminate-user', auth, userController.terminateUserWeb);
+
 router.put('/update-user-client', auth, upload.fields([
   { name: 'user_image', maxCount: 1 },
 ]), userController.updateUserClient);

@@ -17,16 +17,6 @@ const { authLimiter, generalLimiter } = require('./middlewares/rateLimiter');
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ── HTTPS redirect (production only) ─────────────────────────────────────────
-if (process.env.NODE_ENV === 'production') {
-  app.use((req, res, next) => {
-    if (req.headers['x-forwarded-proto'] !== 'https') {
-      return res.redirect(301, `https://${req.headers.host}${req.url}`);
-    }
-    next();
-  });
-}
-
 // ── CORS whitelist ────────────────────────────────────────────────────────────
 const allowedOrigins = process.env.ALLOWED_ORIGINS
   ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
@@ -49,6 +39,18 @@ app.use(cors({
   },
   credentials: true,
 }));
+
+// ── HTTPS redirect (production only) ─────────────────────────────────────────
+// Must come AFTER cors() so OPTIONS preflights get CORS headers before redirect
+if (process.env.NODE_ENV === 'production') {
+  app.use((req, res, next) => {
+    if (req.method === 'OPTIONS') return next();
+    if (req.headers['x-forwarded-proto'] !== 'https') {
+      return res.redirect(301, `https://${req.headers.host}${req.url}`);
+    }
+    next();
+  });
+}
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 // General limiter on all /api routes
