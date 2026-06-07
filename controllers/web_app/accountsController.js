@@ -1541,7 +1541,7 @@ const getTransactionLedger = async (req, res) => {
       .where('tl.org_id', orgId)
       .select(
         'tl.*',
-        db.raw("CONCAT(IFNULL(u.first_name,''), ' ', IFNULL(u.last_name,'')) as created_by_name")
+        db.raw("IFNULL(u.user_name, '') as created_by_name")
       )
       .orderBy('tl.id', 'desc')
       .limit(parseInt(limit))
@@ -1817,7 +1817,7 @@ const getRefunds = async (req, res) => {
       .leftJoin('edx_client_app_users as u', 'u.id', 'r.client_id')
       .where('r.org_id', orgId)
       .select('r.*',
-        db.raw("CONCAT(IFNULL(u.first_name,''), ' ', IFNULL(u.last_name,'')) as client_name"),
+        db.raw("IFNULL(u.user_name, '') as client_name"),
         db.raw("CONCAT('BK-', LPAD(b.id, 6, '0')) as booking_ref")
       )
       .orderBy('r.id', 'desc');
@@ -1844,7 +1844,7 @@ const getRefundById = async (req, res) => {
       .leftJoin('edx_client_app_users as u', 'u.id', 'r.client_id')
       .where('r.id', id).where('r.org_id', orgId)
       .select('r.*',
-        db.raw("CONCAT(IFNULL(u.first_name,''), ' ', IFNULL(u.last_name,'')) as client_name"),
+        db.raw("IFNULL(u.user_name, '') as client_name"),
         db.raw("CONCAT('BK-', LPAD(b.id, 6, '0')) as booking_ref")
       ).first();
     if (!refund) return res.status(404).json({ error: 'Refund not found' });
@@ -2061,7 +2061,7 @@ const getInternalTransfers = async (req, res) => {
       .leftJoin('edx_client_app_users as u', 'u.id', 't.client_id')
       .where('t.org_id', orgId)
       .select('t.*',
-        db.raw("CONCAT(IFNULL(u.first_name,''), ' ', IFNULL(u.last_name,'')) as client_name"),
+        db.raw("IFNULL(u.user_name, '') as client_name"),
         db.raw("CONCAT('BK-', LPAD(sb.id, 6, '0')) as source_booking_ref"),
         db.raw("CONCAT('BK-', LPAD(tb.id, 6, '0')) as target_booking_ref")
       ).orderBy('t.id', 'desc');
