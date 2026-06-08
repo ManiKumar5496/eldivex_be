@@ -764,49 +764,116 @@ else if (status == 5) {
       });
     }
   };
+  // ── Attendance helpers ──────────────────────────────────────────────────────
+  const ATT_STATUSES = ['present', 'absent', 'half_day', 'leave'];
+  const ATT_SHIFTS   = ['live_in', 'live_out'];
+
+  const _attMinutes = (hhmm) => {
+    if (!hhmm || typeof hhmm !== 'string') return null;
+    const m = /^(\d{1,2}):(\d{2})/.exec(hhmm);
+    if (!m) return null;
+    const h = parseInt(m[1], 10), min = parseInt(m[2], 10);
+    if (h > 23 || min > 59) return null;
+    return h * 60 + min;
+  };
+
+  // Working hours are computed server-side (never trust the client). An out-time
+  // at or before the in-time is treated as an overnight (live-in) shift.
+  const _attWorkingHours = (checkIn, checkOut) => {
+    const a = _attMinutes(checkIn), b = _attMinutes(checkOut);
+    if (a === null || b === null) return 0;
+    let diff = b - a;
+    if (diff <= 0) diff += 24 * 60;
+    return Math.round((diff / 60) * 100) / 100;
+  };
+
+  /**
+   * Validates one attendance record and returns either { error } or
+   * { row, bookingId }. Accepts explicit fields or a legacy att_details blob,
+   * and dual-writes att_details for backward compatibility.
+   */
+  const _buildAttendanceRow = (rec, orgId) => {
+    const bookingId = parseInt(rec.booking_id, 10);
+    const hpId      = parseInt(rec.hp_id, 10);
+    const invRaw    = rec.inv_id ? parseInt(rec.inv_id, 10) : null;
+    const invId     = invRaw && invRaw > 0 ? invRaw : null;
+
+    let det = {};
+    if (rec.att_details) {
+      try { det = typeof rec.att_details === 'string' ? JSON.parse(rec.att_details) : rec.att_details; }
+      catch (_) { det = {}; }
+    }
+
+    const status    = (rec.status     || det.status     || '').toString().trim();
+    const shiftType = (rec.shift_type || det.shift_type || 'live_out').toString().trim();
+    const checkIn   = (rec.check_in   || det.check_in   || null) || null;
+    const checkOut  = (rec.check_out  || det.check_out  || null) || null;
+    const notes     = (rec.notes ?? det.notes ?? '').toString();
+    const rawDate   = rec.att_date || rec.from_date || '';
+    const attDate   = /^\d{4}-\d{2}-\d{2}/.test(rawDate) ? rawDate.slice(0, 10) : null;
+
+    if (!Number.isInteger(bookingId) || bookingId <= 0) return { error: 'A valid booking_id is required.' };
+    if (!Number.isInteger(hpId) || hpId <= 0)           return { error: 'A valid hp_id is required.' };
+    if (!attDate)                                       return { error: 'A valid date (YYYY-MM-DD) is required.' };
+    if (!ATT_STATUSES.includes(status))                 return { error: `status must be one of: ${ATT_STATUSES.join(', ')}.` };
+    if (!ATT_SHIFTS.includes(shiftType))                return { error: `shift_type must be one of: ${ATT_SHIFTS.join(', ')}.` };
+
+    const workingHours = _attWorkingHours(checkIn, checkOut);
+
+    const row = {
+      booking_id:    bookingId,
+      inv_id:        invId,
+      hp_id:         hpId,
+      att_date:      attDate,
+      from_date:     attDate,             // keep legacy column populated
+      status,
+      shift_type:    shiftType,
+      check_in:      checkIn,
+      check_out:     checkOut,
+      working_hours: workingHours,
+      notes:         notes || null,
+      att_details:   JSON.stringify({     // dual-write for backward compatibility
+        check_in: checkIn, check_out: checkOut, status,
+        shift_type: shiftType, working_hours: workingHours, notes,
+      }),
+      org_id:        orgId,
+    };
+    return { row, bookingId };
+  };
+
+  // Idempotent write keyed on (org_id, hp_id, att_date): insert or update.
+  const _upsertAttendance = (qb, row, userId, now) =>
+    qb('edx_hp_attendance')
+      .insert({ ...row, created_by: userId, created_on: now, updated_by: userId, updated_on: now })
+      .onConflict(['org_id', 'hp_id', 'att_date'])
+      .merge({
+        booking_id: row.booking_id, inv_id: row.inv_id, status: row.status,
+        shift_type: row.shift_type, check_in: row.check_in, check_out: row.check_out,
+        working_hours: row.working_hours, notes: row.notes, from_date: row.from_date,
+        att_details: row.att_details, updated_by: userId, updated_on: now,
+      });
+
   const markAttendance = async (req, res) => {
     try {
-      const { booking_id, inv_id, from_date, att_details, hp_id } = req.body;
       const userId = req.login_data.id;
       const orgId  = getOrgId(req);
+      const now    = getCurrentDateTime();
 
-      // ── Validation (return 400 for bad input, not 500) ──────────────────────
-      const bookingId = parseInt(booking_id, 10);
-      const hpId      = parseInt(hp_id, 10);
-      const invId     = inv_id ? parseInt(inv_id, 10) : null;
+      const built = _buildAttendanceRow(req.body, orgId);
+      if (built.error) return res.status(400).json({ message: built.error });
 
-      if (!Number.isInteger(bookingId) || bookingId <= 0) {
-        return res.status(400).json({
-          message: 'A valid booking_id is required to mark attendance.',
-        });
-      }
-      if (!Number.isInteger(hpId) || hpId <= 0) {
-        return res.status(400).json({ message: 'A valid hp_id is required.' });
-      }
-      if (!from_date) {
-        return res.status(400).json({ message: 'from_date is required.' });
-      }
-
-      // Ensure the booking exists in this org before inserting — avoids the
-      // booking_id FK violation surfacing to the client as an opaque 500.
+      // Ensure the booking exists in this org — avoids the FK violation
+      // surfacing to the client as an opaque 500.
       const booking = await db('edx_bookings')
-        .where({ id: bookingId, org_id: orgId })
+        .where({ id: built.bookingId, org_id: orgId })
         .first('id');
       if (!booking) {
         return res.status(400).json({
-          message: `Booking #${bookingId} was not found for this organisation.`,
+          message: `Booking #${built.bookingId} was not found for this organisation.`,
         });
       }
 
-      await db('edx_hp_attendance').insert(withOrg(req, {
-        booking_id:  bookingId,
-        inv_id:      invId && invId > 0 ? invId : null,
-        from_date:   from_date,
-        att_details: att_details || null,
-        hp_id:       hpId,
-        created_on:  getCurrentDateTime(),
-        created_by:  userId,
-      }));
+      await _upsertAttendance(db, built.row, userId, now);
 
       res.status(201).json({ message: 'Attendance marked successfully.' });
     } catch (err) {
@@ -815,10 +882,77 @@ else if (status == 5) {
       res.status(500).json({ message: 'Error marking attendance.', error: err.message });
     }
   };
+
+  /**
+   * Batch attendance: accepts { records: [...] } and upserts them in a single
+   * transaction. Per-record validation failures are returned in `failed[]`
+   * without aborting the valid rows.
+   */
+  const markAttendanceBatch = async (req, res) => {
+    try {
+      const userId  = req.login_data.id;
+      const orgId   = getOrgId(req);
+      const now     = getCurrentDateTime();
+      const records = Array.isArray(req.body?.records) ? req.body.records : null;
+
+      if (!records || records.length === 0) {
+        return res.status(400).json({ message: 'records[] is required and must be non-empty.' });
+      }
+      if (records.length > 500) {
+        return res.status(400).json({ message: 'Too many records in one batch (max 500).' });
+      }
+
+      const built  = [];
+      const failed = [];
+      records.forEach((rec, index) => {
+        const b = _buildAttendanceRow(rec, orgId);
+        if (b.error) failed.push({ index, hp_id: rec.hp_id ?? null, error: b.error });
+        else         built.push({ index, ...b });
+      });
+
+      // Verify every referenced booking exists in this org (one query).
+      const bookingIds = [...new Set(built.map(b => b.bookingId))];
+      const existing = bookingIds.length
+        ? (await db('edx_bookings').whereIn('id', bookingIds).where('org_id', orgId).select('id'))
+            .map(r => r.id)
+        : [];
+      const existingSet = new Set(existing);
+
+      const toUpsert = [];
+      for (const b of built) {
+        if (existingSet.has(b.bookingId)) toUpsert.push(b.row);
+        else failed.push({ index: b.index, hp_id: b.row.hp_id, error: `Booking #${b.bookingId} not found.` });
+      }
+
+      let saved = 0;
+      if (toUpsert.length) {
+        await withTransaction(async (trx) => {
+          for (const row of toUpsert) {
+            await _upsertAttendance(trx, row, userId, now);
+            saved++;
+          }
+        });
+      }
+
+      res.status(saved === 0 && failed.length ? 400 : 200).json({
+        message: `Attendance saved for ${saved} HP(s)` + (failed.length ? `, ${failed.length} failed.` : '.'),
+        saved,
+        failed,
+      });
+    } catch (err) {
+      logger.error(`Error markAttendanceBatch: ${err.message}`);
+      console.error(err);
+      res.status(500).json({ message: 'Error saving attendance batch.', error: err.message });
+    }
+  };
   const getAttendanceList = async (req, res) => {
     try {
       const { hp_id, from_date, to_date } = req.query;
       const orgId = getOrgId(req);
+
+      // COALESCE(att_date, from_date) lets legacy rows (pre-normalisation) and
+      // new rows both filter/sort on a single effective date.
+      const effDate = "COALESCE(a.att_date, a.from_date)";
 
       let q = db('edx_hp_attendance as a')
         .leftJoin('edx_hp_registration as hp', 'a.hp_id', 'hp.hp_reg_id')
@@ -828,24 +962,44 @@ else if (status == 5) {
           'a.booking_id',
           'a.inv_id',
           'a.from_date',
+          'a.att_date',
+          'a.status',
+          'a.shift_type',
+          'a.check_in',
+          'a.check_out',
+          'a.working_hours',
+          'a.notes',
           'a.att_details',
           'a.hp_id',
           'a.created_on',
           'a.created_by',
+          'a.updated_on',
           db.raw("CONCAT(COALESCE(hp.hp_reg_first_name,''),' ',COALESCE(hp.hp_reg_last_name,'')) as hp_name"),
           'hp.hp_reg_phone_number'
         )
-        .orderBy('a.from_date', 'desc');
+        .orderByRaw(`${effDate} desc`);
 
       if (hp_id)     q = q.where('a.hp_id', hp_id);
-      if (from_date) q = q.whereRaw('a.from_date >= ?', [from_date]);
-      if (to_date)   q = q.whereRaw('a.from_date <= ?', [to_date]);
+      if (from_date) q = q.whereRaw(`${effDate} >= ?`, [from_date]);
+      if (to_date)   q = q.whereRaw(`${effDate} <= ?`, [to_date]);
 
       const rows = await q;
       const data = rows.map(r => {
+        // Legacy rows only carry att_details JSON; fall back to it when the
+        // first-class columns are still null.
         let d = {};
-        try { d = JSON.parse(r.att_details); } catch (_) {}
-        return { ...r, att_details: d };
+        try { d = JSON.parse(r.att_details) || {}; } catch (_) {}
+        return {
+          ...r,
+          att_date:      r.att_date      ?? r.from_date ?? null,
+          status:        r.status        ?? d.status ?? null,
+          shift_type:    r.shift_type    ?? d.shift_type ?? null,
+          check_in:      r.check_in      ?? d.check_in ?? null,
+          check_out:     r.check_out     ?? d.check_out ?? null,
+          working_hours: r.working_hours ?? d.working_hours ?? 0,
+          notes:         r.notes         ?? d.notes ?? null,
+          att_details:   d,
+        };
       });
 
       res.json(data);
@@ -1499,6 +1653,7 @@ module.exports = {
     getUserBookings,
     holdBooking,
     markAttendance,
+    markAttendanceBatch,
     extendBooking,
     cancelUserService,
     updateBooking,

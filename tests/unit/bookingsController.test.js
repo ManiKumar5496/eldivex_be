@@ -42,6 +42,7 @@ const {
   holdBooking,
   assignHPToBooking,
   markAttendance,
+  markAttendanceBatch,
   cancelUserService,
   extendBooking,
   finalBookingSave,
@@ -426,27 +427,89 @@ describe('assignHPToBooking', () => {
 // markAttendance
 // ─────────────────────────────────────────────────────────────────────────────
 
+// An insert→onConflict→merge chain (the UPSERT path) that resolves to `value`.
+function upsertChain(value = 1) {
+  const c = {};
+  c.insert     = jest.fn().mockReturnValue(c);
+  c.onConflict = jest.fn().mockReturnValue(c);
+  c.merge      = jest.fn().mockResolvedValue(value);
+  return c;
+}
+
+const validAtt = {
+  booking_id: 5, hp_id: 7, att_date: '2026-06-01',
+  status: 'present', shift_type: 'live_out',
+  check_in: '09:00', check_out: '21:00',
+};
+
 describe('markAttendance', () => {
-  test('responds 201 on success', async () => {
-    db.mockReturnValueOnce(chain(1));
+  test('responds 201 on success (booking exists → upsert)', async () => {
+    db.mockReturnValueOnce(chain({ id: 5 }))  // booking lookup
+      .mockReturnValueOnce(upsertChain());     // upsert
     const res = mockRes();
-    await markAttendance(
-      mockReq({ booking_id: 5, from_date: '2026-06-01', att_details: 'Present', hp_id: 7 }),
-      res
-    );
+    await markAttendance(mockReq({ ...validAtt }), res);
     expect(res.status).toHaveBeenCalledWith(201);
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({ message: 'Attendance marked successfully.' })
     );
   });
 
-  test('responds 500 on DB error', async () => {
-    const badChain = chain(null);
-    badChain.insert = jest.fn().mockRejectedValue(new Error('DB fail'));
-    db.mockReturnValueOnce(badChain);
+  test('responds 400 when booking_id is missing/invalid', async () => {
     const res = mockRes();
-    await markAttendance(mockReq({ booking_id: 5 }), res);
+    await markAttendance(mockReq({ hp_id: 7, att_date: '2026-06-01', status: 'present' }), res);
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('responds 400 when status is not a valid enum', async () => {
+    const res = mockRes();
+    await markAttendance(mockReq({ ...validAtt, status: 'whoops' }), res);
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('responds 400 when the booking does not exist', async () => {
+    db.mockReturnValueOnce(chain(undefined)); // booking lookup → not found
+    const res = mockRes();
+    await markAttendance(mockReq({ ...validAtt }), res);
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('responds 500 on DB error', async () => {
+    const bad = upsertChain();
+    bad.merge = jest.fn().mockRejectedValue(new Error('DB fail'));
+    db.mockReturnValueOnce(chain({ id: 5 })) // booking exists
+      .mockReturnValueOnce(bad);              // upsert fails
+    const res = mockRes();
+    await markAttendance(mockReq({ ...validAtt }), res);
     expect(res.status).toHaveBeenCalledWith(500);
+  });
+});
+
+describe('markAttendanceBatch', () => {
+  test('responds 400 when records[] is empty', async () => {
+    const res = mockRes();
+    await markAttendanceBatch(mockReq({ records: [] }), res);
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('upserts valid records and reports failures', async () => {
+    db.mockReturnValueOnce(chain([{ id: 5 }])); // booking existence lookup
+    const trxFn = jest.fn(() => upsertChain());
+    withTransaction.mockImplementation(async (cb) => cb(trxFn));
+
+    const res = mockRes();
+    await markAttendanceBatch(mockReq({
+      records: [
+        { ...validAtt },                          // valid
+        { hp_id: 8, status: 'present' },          // invalid → no booking_id
+      ],
+    }), res);
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ saved: 1, failed: expect.arrayContaining([
+        expect.objectContaining({ index: 1 }),
+      ]) })
+    );
   });
 });
 
