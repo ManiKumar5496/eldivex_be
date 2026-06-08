@@ -16,7 +16,9 @@ const createUserSchema = Joi.object({
   }),
   user_password: Joi.string().min(6).required(),
   user_role: Joi.number().integer().required(),
-  user_gender: Joi.string().valid('Male', 'Female', 'Other').optional(),
+  user_gender: Joi.number().integer().valid(1, 2, 3).optional().messages({
+    'any.only': 'Gender must be 1 (Male), 2 (Female) or 3 (Other)'
+  }),
   user_home_branch: Joi.number().integer().optional(),
   user_branch_access: Joi.string().optional()
 });
