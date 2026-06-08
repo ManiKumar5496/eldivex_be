@@ -2,7 +2,7 @@ const getBookings = require('../../models/web_app/bookingsModel');
 const db = require('../../config/db');
 const logger = require('../../logger');
 require('dotenv').config();
-const { getCurrentDateTime } = require("../../utils/dateTime");
+const { getCurrentDateTime, mysqlDateAddDays } = require("../../utils/dateTime");
 const withTransaction = require('../../utils/withTransaction');
 const { sendEmail } = require('../../utils/emailService');
 const { bookingConfirmed, otpDelivery, invoiceGenerated, creditNoteGenerated, cancellationBillingSummary } = require('../../utils/emailTemplates');
@@ -61,11 +61,20 @@ async function _computeCancellationBilling({ booking_id, cancel_date }) {
     if (!booking) return null;
 
     const startDate  = booking.service_start_date;
-    const finalRate  = parseFloat(booking.final_rate) || 0;
-    const cancelOn   = cancel_date || new Date().toISOString().split('T')[0];
+    const finalRate  = parseFloat(booking.final_rate) || parseFloat(booking.base_rate) || 0;
+    const cancelOn   = cancel_date || mysqlDateAddDays(0);
 
     const start    = new Date(startDate);
     const end      = new Date(cancelOn);
+
+    // Bail out on un-billable data instead of computing a bogus settlement.
+    // An invalid/missing start date would make daysUsed=0 → amount_due=0 →
+    // the entire paid amount would be flagged refundable and auto-written-off.
+    if (isNaN(start.getTime()) || isNaN(end.getTime()) || finalRate <= 0) {
+      logger.warn(`[accounts] Skipping cancellation billing for booking #${booking_id}: invalid start date or rate.`);
+      return null;
+    }
+
     const daysUsed = start <= end ? Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1 : 0;
     const amountDue = daysUsed * finalRate;
 
@@ -137,6 +146,16 @@ const createBooking = async (req, res) => {
       } = req.body;
       const userId = req.login_data.id;
 
+      // A booking must carry a usable positive rate, otherwise the invoice
+      // raised at OTP verification would be ₹0. base_rate is stored as the
+      // string 'NA' when omitted, so parseFloat would yield NaN.
+      const parsedBaseRate = parseFloat(base_rate);
+      if (!Number.isFinite(parsedBaseRate) || parsedBaseRate <= 0) {
+        return res.status(400).json({
+          message: 'A valid base_rate (greater than 0) is required to create a booking.',
+        });
+      }
+
       let booking_id;
       await withTransaction(async (trx) => {
         const [patient_id] = await trx('edx_patient').insert(withOrg(req, {
@@ -165,7 +184,7 @@ const createBooking = async (req, res) => {
           service_start_time: service_start_time || 'NA',
           service_end_time: service_end_time || 'NA',
           address_id: address_id || 'NA',
-          base_rate: base_rate || 'NA',
+          base_rate: parsedBaseRate,
           base_discount_percentage: base_discount_percentage ?? null,
           created_by: userId,
           created_on: getCurrentDateTime()
@@ -379,6 +398,19 @@ const createBooking = async (req, res) => {
         }
       });
 
+      // Rate fields, when supplied, must be valid positive numbers so the
+      // invoice raised at OTP verification is never ₹0.
+      for (const rateField of ['base_rate', 'final_rate']) {
+        if (updatePayload[rateField] !== undefined && updatePayload[rateField] !== null) {
+          const parsed = parseFloat(updatePayload[rateField]);
+          if (!Number.isFinite(parsed) || parsed <= 0) {
+            return res.status(400).json({
+              message: `${rateField} must be a number greater than 0.`,
+            });
+          }
+        }
+      }
+
       // audit fields
       updatePayload.updated_on = getCurrentDateTime();
       updatePayload.updated_by = req.login_data?.id || null;
@@ -407,7 +439,13 @@ const createBooking = async (req, res) => {
       });
 
       // ── Log rate change if final_rate changed (fire-and-forget) ─────────────
-      if (final_rate !== undefined && existingBooking.final_rate !== final_rate) {
+      // Compare numerically: existing final_rate is a DECIMAL string ("1500.00")
+      // while the incoming value may be a number or "1500", so a raw !== compare
+      // would log a spurious change on every save.
+      if (
+        final_rate !== undefined &&
+        (parseFloat(existingBooking.final_rate) || 0) !== (parseFloat(final_rate) || 0)
+      ) {
         setImmediate(() => _logRateChange({
           booking_id:    bookingId,
           old_rate:      existingBooking.final_rate,
@@ -490,13 +528,13 @@ if (status == 3) {
   setImmediate(async () => {
     try {
       const hp = await db('edx_hp_registration')
-        .where({ hp_reg_id: hp_unique_id })
+        .where({ hp_reg_id: hp_unique_id, org_id: getOrgId(req) })
         .select('hp_reg_email', 'hp_reg_first_name', 'hp_reg_last_name', 'hp_reg_phone_number')
         .first();
 
       const patientRow = await db('edx_bookings')
         .leftJoin('edx_patient', 'edx_bookings.patient_id', 'edx_patient.id')
-        .where({ 'edx_bookings.id': bookingId })
+        .where({ 'edx_bookings.id': bookingId, 'edx_bookings.org_id': getOrgId(req) })
         .select('edx_patient.patient_name')
         .first();
 
@@ -637,10 +675,13 @@ else if (status == 5) {
           const booking = await db('edx_bookings as b')
             .leftJoin('edx_web_app_users as u', 'b.user_id', 'u.id')
             .where('b.id', booking_id)
+            .where('b.org_id', getOrgId(req))
             .select('u.user_email', 'u.user_name')
             .first();
           if (booking && booking.user_email && booking.user_email !== 'NA') {
-            const booking_data = await db('edx_bookings').where({ id: booking_id }).first();
+            const booking_data = await db('edx_bookings')
+              .where({ id: booking_id, org_id: getOrgId(req) })
+              .first();
             const finalRate = parseFloat(booking_data?.final_rate) || 0;
             let holdDays = 0;
             if (from_date && to_date) {
@@ -727,13 +768,42 @@ else if (status == 5) {
     try {
       const { booking_id, inv_id, from_date, att_details, hp_id } = req.body;
       const userId = req.login_data.id;
+      const orgId  = getOrgId(req);
+
+      // ── Validation (return 400 for bad input, not 500) ──────────────────────
+      const bookingId = parseInt(booking_id, 10);
+      const hpId      = parseInt(hp_id, 10);
+      const invId     = inv_id ? parseInt(inv_id, 10) : null;
+
+      if (!Number.isInteger(bookingId) || bookingId <= 0) {
+        return res.status(400).json({
+          message: 'A valid booking_id is required to mark attendance.',
+        });
+      }
+      if (!Number.isInteger(hpId) || hpId <= 0) {
+        return res.status(400).json({ message: 'A valid hp_id is required.' });
+      }
+      if (!from_date) {
+        return res.status(400).json({ message: 'from_date is required.' });
+      }
+
+      // Ensure the booking exists in this org before inserting — avoids the
+      // booking_id FK violation surfacing to the client as an opaque 500.
+      const booking = await db('edx_bookings')
+        .where({ id: bookingId, org_id: orgId })
+        .first('id');
+      if (!booking) {
+        return res.status(400).json({
+          message: `Booking #${bookingId} was not found for this organisation.`,
+        });
+      }
 
       await db('edx_hp_attendance').insert(withOrg(req, {
-        booking_id:  parseInt(booking_id, 10) || 0,
-        inv_id:      inv_id ? parseInt(inv_id, 10) : null,
-        from_date:   from_date   || null,
+        booking_id:  bookingId,
+        inv_id:      invId && invId > 0 ? invId : null,
+        from_date:   from_date,
         att_details: att_details || null,
-        hp_id:       hp_id ? parseInt(hp_id, 10) : null,
+        hp_id:       hpId,
         created_on:  getCurrentDateTime(),
         created_by:  userId,
       }));
@@ -859,7 +929,7 @@ else if (status == 5) {
               inv_start:       term_date || getCurrentDateTime(),
               inv_end:         term_date || getCurrentDateTime(),
               inv_date:        getCurrentDateTime(),
-              due_date:        new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+              due_date:        mysqlDateAddDays(7),
               invoice_type:    'Regular',
               org_id:          req.login_data?.org_id ?? 1,
               created_by:      userId,
@@ -930,22 +1000,29 @@ else if (status == 5) {
       const userId = req.login_data.id;
 
       // Fetch booking to auto-calculate invoice amount from final_rate
-      const booking = await db('edx_bookings').where({ id: booking_id }).first();
+      const booking = await db('edx_bookings')
+        .where({ id: booking_id, org_id: getOrgId(req) })
+        .first();
       if (!booking) {
         return res.status(404).json({ message: 'Booking not found.' });
       }
 
       const start = new Date(from_date);
       const end = new Date(to_date);
+      if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+        return res.status(400).json({ message: 'Invalid from_date or to_date.' });
+      }
       const totalDays = Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1;
-      const finalRate = parseFloat(booking.final_rate) || 0;
+      if (!(totalDays > 0)) {
+        return res.status(400).json({ message: 'to_date must be on or after from_date.' });
+      }
+      const finalRate = parseFloat(booking.final_rate) || parseFloat(booking.base_rate) || 0;
       const inv_raised_amnt = totalDays * finalRate;
 
-      // Due date = today + payment terms (default 15 days)
+      // Due date = today + payment terms (default 15 days). Use local-date
+      // formatting to avoid the UTC off-by-one in timezones ahead of UTC.
       const paymentTermsDays = parseInt(process.env.PAYMENT_TERMS_DAYS || '15');
-      const dueDate = new Date();
-      dueDate.setDate(dueDate.getDate() + paymentTermsDays);
-      const dueDateStr = dueDate.toISOString().split('T')[0];
+      const dueDateStr = mysqlDateAddDays(paymentTermsDays);
 
       await withTransaction(async (trx) => {
         const [invoice_id] = await trx('edx_invoice').insert(withOrg(req, {
@@ -984,7 +1061,7 @@ else if (status == 5) {
 
         if (hp_unique_id) {
           await trx('edx_booking_hp')
-            .where({ bkng_id: booking_id, hp_unique_id: hp_unique_id })
+            .where({ bkng_id: booking_id, hp_unique_id: hp_unique_id, org_id: getOrgId(req) })
             .update({
               end_date_planned: to_date,
               in_time: from_time || db.raw('in_time'),
@@ -1045,12 +1122,17 @@ else if (status == 5) {
       const userId = req.login_data.id;
   
       /* 1️⃣ Verify OTP */
+      // forUpdate() locks the row for this transaction so two concurrent
+      // verifications with the same OTP can't both pass the otp_verified check
+      // and each raise an invoice (duplicate-invoice race).
       const hpBooking = await trx('edx_booking_hp')
         .where({
           bkng_id: booking_id,
           hp_unique_id: hp_unique_id,
-          otp: otp
+          otp: otp,
+          org_id: getOrgId(req)
         })
+        .forUpdate()
         .first();
   
       if (!hpBooking) {
@@ -1067,17 +1149,18 @@ else if (status == 5) {
       await trx('edx_booking_hp')
         .where({
           bkng_id: booking_id,
-          hp_unique_id: hp_unique_id
+          hp_unique_id: hp_unique_id,
+          org_id: getOrgId(req)
         })
         .update({
           otp_verified: 1,
           otp_verification_datetime: db.fn.now(),
           updated_by: userId
         });
-  
+
       /* 3️⃣ Get booking details */
       const booking = await trx('edx_bookings')
-        .where({ id: booking_id })
+        .where({ id: booking_id, org_id: getOrgId(req) })
         .first();
   
       if (!booking) {
@@ -1087,23 +1170,46 @@ else if (status == 5) {
   
       const startDate = booking.service_start_date;
       const endDate = booking.service_end_date;
-      const finalRate = booking.final_rate || 0;
-  
+      // final_rate is only persisted when the booking is explicitly edited;
+      // on a freshly created booking it is NULL, so fall back to base_rate.
+      const finalRate = parseFloat(booking.final_rate) || parseFloat(booking.base_rate) || 0;
+
+      // Refuse to raise a ₹0 invoice — the booking has no usable rate set.
+      if (!(finalRate > 0)) {
+        await trx.rollback();
+        return res.status(400).json({
+          message: "Cannot raise invoice: booking has no valid rate. Set the booking rate before verifying OTP.",
+        });
+      }
+
       /* 4️⃣ Calculate total days */
       const start = new Date(startDate);
       const end = new Date(endDate);
-  
+
+      // Guard against 'NA'/invalid dates that would make the invoice amount NaN.
+      if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+        await trx.rollback();
+        return res.status(400).json({
+          message: "Cannot raise invoice: booking has invalid service dates.",
+        });
+      }
+
       const diffTime = end - start;
       const totalDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
-  
+
+      if (!(totalDays > 0)) {
+        await trx.rollback();
+        return res.status(400).json({
+          message: "Cannot raise invoice: service end date must be on or after the start date.",
+        });
+      }
+
       /* 5️⃣ Calculate invoice */
       const invoiceAmount = totalDays * finalRate;
   
       /* 6️⃣ Insert invoice with due_date */
       const invPaymentTermsDays = parseInt(process.env.PAYMENT_TERMS_DAYS || '15');
-      const invDueDate = new Date();
-      invDueDate.setDate(invDueDate.getDate() + invPaymentTermsDays);
-      const invDueDateStr = invDueDate.toISOString().split('T')[0];
+      const invDueDateStr = mysqlDateAddDays(invPaymentTermsDays);
 
       const [invoice_id] = await trx('edx_invoice').insert(withOrg(req, {
         booking_id:      booking_id,
@@ -1121,7 +1227,8 @@ else if (status == 5) {
       await trx('edx_booking_hp')
         .where({
           bkng_id: booking_id,
-          hp_unique_id: hp_unique_id
+          hp_unique_id: hp_unique_id,
+          org_id: getOrgId(req)
         })
         .update({
           service_start_date: startDate,
@@ -1130,10 +1237,10 @@ else if (status == 5) {
           updated_by: userId,
           status:4
         });
-  
+
       /* 8️⃣ Update HP status */
       await trx('edx_hp_registration')
-        .where({ hp_reg_id: hp_unique_id })
+        .where({ hp_reg_id: hp_unique_id, org_id: getOrgId(req) })
         .update({
           hp_reg_status: 5,
           updated_on: db.fn.now(),
@@ -1300,6 +1407,7 @@ const getMatchedHPs = async (req, res) => {
     //     with status Active/Confirmed/In-Progress)
     const conflictingHpIds = (await db('edx_booking_hp as bh')
       .join('edx_bookings as b2', 'bh.booking_id', 'b2.id')
+      .where('b2.org_id', getOrgId(req))
       .whereIn('b2.status', ['Active', 'Confirmed', 'In-Progress', 'confirmed', 'active'])
       .where(function () {
         this
@@ -1332,6 +1440,7 @@ const getMatchedHPs = async (req, res) => {
     const historyRows = await db('edx_booking_hp as bh')
       .join('edx_bookings as b3', 'bh.booking_id', 'b3.id')
       .where('b3.user_id', userId)
+      .where('b3.org_id', getOrgId(req))
       .select('bh.hp_unique_id');
     const historySet = new Set(historyRows.map(r => r.hp_unique_id));
 
