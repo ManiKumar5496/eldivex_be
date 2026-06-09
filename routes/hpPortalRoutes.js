@@ -16,6 +16,7 @@ const hp = require('../controllers/web_app/hpPortalController');
 
 // ── Auth (public, brute-force limited) ─────────────────────────────────────────
 router.get('/org/bySlug/:slug',       hpAuthCtrl.getOrgBySlug);
+router.get('/org/byId/:id',           hpAuthCtrl.getOrgById);
 router.post('/hpAuth/requestOtp',      authLimiter, hpAuthCtrl.requestOtp);
 router.post('/hpAuth/verifyOtp',       authLimiter, hpAuthCtrl.verifyOtp);
 

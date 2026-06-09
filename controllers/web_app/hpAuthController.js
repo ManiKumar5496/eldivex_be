@@ -65,6 +65,24 @@ const getOrgBySlug = async (req, res) => {
 };
 
 /**
+ * GET /api/org/byId/:id — public.
+ * Lets a caregiver link that carries org_id (instead of a slug) still show the
+ * organisation name on the login screen.
+ */
+const getOrgById = async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ message: 'A valid org id is required.' });
+    const org = await db('edx_organizations').where({ id }).first('id', 'name', 'slug', 'status');
+    if (!org || org.status !== 'active') return res.status(404).json({ message: 'Organisation not found.' });
+    res.json({ org_id: org.id, org_name: org.name, slug: org.slug });
+  } catch (err) {
+    logger.error(`Error getOrgById: ${err.message}`);
+    res.status(500).json({ message: 'Error resolving organisation.' });
+  }
+};
+
+/**
  * POST /api/hpAuth/requestOtp — { phone, org_id }
  */
 const requestOtp = async (req, res) => {
@@ -121,24 +139,48 @@ const verifyOtp = async (req, res) => {
       return res.status(400).json({ message: 'phone, org_id and otp are required.' });
     }
 
-    const row = await db('edx_hp_login_otp')
+    // ── TEMPORARY (testing): accept a static OTP so the portal can be used
+    // before SMS delivery is wired up. The HP must still exist and be active in
+    // this org. Set HP_STATIC_OTP='' (empty) in env to disable and enforce real
+    // OTPs. Remove this block when going live. ─────────────────────────────────
+    const STATIC_OTP = process.env.HP_STATIC_OTP ?? '123456';
+    if (STATIC_OTP && otp === STATIC_OTP) {
+      const hp = await findHpByPhone(orgId, phone10);
+      if (!hp) return res.status(403).json({ message: 'Your account is not active. Please contact support.' });
+      const token = generateHpToken({ hp_id: hp.hp_reg_id, org_id: orgId });
+      return res.status(200).json({
+        message: 'Login successful',
+        token,
+        hp_id: hp.hp_reg_id,
+        org_id: orgId,
+        hp_name: `${hp.hp_reg_first_name || ''} ${hp.hp_reg_last_name || ''}`.trim(),
+      });
+    }
+
+    // Consider all live OTPs for this number (a caregiver may legitimately have
+    // requested more than once); match against any so an earlier valid code
+    // still works. Newest first, capped to keep bcrypt comparisons bounded.
+    const candidates = await db('edx_hp_login_otp')
       .where({ org_id: orgId, phone: phone10, consumed: 0 })
       .whereRaw('expires_at > NOW()')
       .orderBy('id', 'desc')
-      .first();
+      .limit(5);
 
-    if (!row) {
+    if (candidates.length === 0) {
       return res.status(400).json({ message: 'Invalid or expired OTP. Please request a new one.' });
     }
 
-    if (row.attempts >= 5) {
-      await db('edx_hp_login_otp').where({ id: row.id }).update({ consumed: 1 });
+    if (candidates[0].attempts >= 5) {
+      await db('edx_hp_login_otp').where({ id: candidates[0].id }).update({ consumed: 1 });
       return res.status(429).json({ message: 'Too many attempts. Please request a new OTP.' });
     }
 
-    const match = await bcrypt.compare(otp, row.otp_hash);
-    if (!match) {
-      await db('edx_hp_login_otp').where({ id: row.id }).increment('attempts', 1);
+    let row = null;
+    for (const c of candidates) {
+      if (await bcrypt.compare(otp, c.otp_hash)) { row = c; break; }
+    }
+    if (!row) {
+      await db('edx_hp_login_otp').where({ id: candidates[0].id }).increment('attempts', 1);
       return res.status(400).json({ message: 'Incorrect OTP.' });
     }
 
@@ -167,4 +209,4 @@ const verifyOtp = async (req, res) => {
   }
 };
 
-module.exports = { getOrgBySlug, requestOtp, verifyOtp };
+module.exports = { getOrgBySlug, getOrgById, requestOtp, verifyOtp };
