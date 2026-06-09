@@ -88,6 +88,10 @@ app.use('/api', hpRoutes);
 const hpPortalRoutes = require('./routes/hpPortalRoutes');
 app.use('/api', hpPortalRoutes);
 
+// Client self-service portal — customer login + clientAuth-guarded endpoints.
+const clientPortalRoutes = require('./routes/clientPortalRoutes');
+app.use('/api', clientPortalRoutes);
+
 // ── Phase 5 — Subscription (getPlans is public — must be before auth groups) ──
 const orgRoutes          = require('./routes/orgRoutes');
 const subscriptionRoutes = require('./routes/subscriptionRoutes');

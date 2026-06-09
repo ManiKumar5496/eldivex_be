@@ -31,3 +31,15 @@ exports.generateHpToken = ({ hp_id, org_id }) =>
     SECRET,
     { expiresIn: HP_EXPIRY }
   );
+
+// Client self-service token. Carries role:'client' + user_id + org_id. The
+// clientAuth middleware derives identity ONLY from these claims, enforcing
+// per-client and cross-org data isolation.
+const CLIENT_EXPIRY = process.env.CLIENT_JWT_EXPIRES_IN || '7d';
+
+exports.generateClientToken = ({ user_id, org_id }) =>
+  jwt.sign(
+    { role: 'client', user_id, org_id: org_id ?? 1 },
+    SECRET,
+    { expiresIn: CLIENT_EXPIRY }
+  );
