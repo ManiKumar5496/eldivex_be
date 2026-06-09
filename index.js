@@ -83,6 +83,11 @@ app.use('/api', masterservicesRoutes);
 const hpRoutes = require('./routes/hpRoutes');
 app.use('/api', hpRoutes);
 
+// HP self-service portal — caregiver login (public + rate-limited) and
+// hpAuth-guarded self-service endpoints (auth applied per-route inside).
+const hpPortalRoutes = require('./routes/hpPortalRoutes');
+app.use('/api', hpPortalRoutes);
+
 // ── Phase 5 — Subscription (getPlans is public — must be before auth groups) ──
 const orgRoutes          = require('./routes/orgRoutes');
 const subscriptionRoutes = require('./routes/subscriptionRoutes');
