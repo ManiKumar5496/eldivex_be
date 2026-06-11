@@ -21,6 +21,16 @@ const isDev = process.env.NODE_ENV !== 'production';
 const normalisePhone = (raw) =>
   String(raw || '').replace(/^\+?91/, '').replace(/\D/g, '').slice(-10);
 
+// Org kill-switch: suspended/cancelled orgs cannot use the client portal.
+const ORG_SUSPENDED_RESPONSE = {
+  code: 'ORG_SUSPENDED',
+  message: 'Your organisation account has been suspended. Please contact support.',
+};
+const isOrgBlocked = async (orgId) => {
+  const org = await db('edx_organizations').where({ id: orgId }).first('status');
+  return !org || !['active', 'trial'].includes(org.status);
+};
+
 // Match an active client by the last 10 digits of their phone, scoped to one org.
 const findClientByPhone = (orgId, phone10) =>
   db('edx_client_app_users')
@@ -37,6 +47,8 @@ const requestOtp = async (req, res) => {
     if (!orgId || phone10.length !== 10) {
       return res.status(400).json({ message: 'A valid phone number and org_id are required.' });
     }
+
+    if (await isOrgBlocked(orgId)) return res.status(403).json(ORG_SUSPENDED_RESPONSE);
 
     const client = await findClientByPhone(orgId, phone10);
     if (!client) return res.status(200).json(generic);
@@ -68,6 +80,8 @@ const verifyOtp = async (req, res) => {
     if (!orgId || phone10.length !== 10 || !otp) {
       return res.status(400).json({ message: 'phone, org_id and otp are required.' });
     }
+
+    if (await isOrgBlocked(orgId)) return res.status(403).json(ORG_SUSPENDED_RESPONSE);
 
     // ── TEMPORARY (testing): accept a static OTP. Remove / set CLIENT_STATIC_OTP=''
     // in env to enforce real OTPs. ─────────────────────────────────────────────

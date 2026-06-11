@@ -62,6 +62,12 @@ app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 // ── Auth middleware ───────────────────────────────────────────────────────────
 const auth = require('./middlewares/auth');
 
+// ── Organisation kill-switch ──────────────────────────────────────────────────
+// Blocks suspended/cancelled orgs on every /api route (403 ORG_SUSPENDED).
+// Self-decodes the JWT, so it must be mounted before all route groups.
+const orgStatusGate = require('./middlewares/orgStatusGate');
+app.use('/api', orgStatusGate);
+
 // ── Validators ────────────────────────────────────────────────────────────────
 const validate = require('./middlewares/validateRequest');
 const { loginWebSchema, createUserSchema } = require('./validators/userValidator');
@@ -132,12 +138,19 @@ app.use('/api', reportsRoutes);
 const leadsRoutes = require('./routes/leadsRoutes');
 app.use('/api', leadsRoutes);
 
+// ── Hostel module — auth applied per-route ────────────────────────────────────
+const hostelsRoutes = require('./routes/hostelsRoutes');
+app.use('/api', hostelsRoutes);
+
 // ── Phase 4.3 — Weekly report cron ───────────────────────────────────────────
 const { startWeeklyReportCron } = require('./cron/weeklyReport');
 startWeeklyReportCron();
 
 // ── Payment reminder cron (daily at 09:00 AM) ─────────────────────────────────
 require('./cron/paymentReminders');
+
+// ── SaaS billing cron (daily at 08:00 AM — monthly invoices + auto-overdue) ───
+require('./cron/saasBilling');
 
 // ── Global error handler (must be last) ───────────────────────────────────────
 app.use(errorHandler);

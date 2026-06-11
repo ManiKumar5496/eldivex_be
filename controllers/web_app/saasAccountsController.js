@@ -19,6 +19,7 @@ const db     = require('../../config/db');
 const logger = require('../../logger');
 const { getCurrentDateTime } = require('../../utils/dateTime');
 const { logAudit }           = require('../../utils/auditLogger');
+const { invalidateOrgStatusCache } = require('../../middlewares/orgStatusGate');
 
 // ── Allowed subscription status transitions ───────────────────────────────────
 const ALLOWED_TRANSITIONS = {
@@ -214,6 +215,7 @@ const transitionSubscriptionStatus = async (req, res) => {
     if (new_status === 'cancelled') {
       await db('edx_organizations').where('id', org_id).update({ status: 'cancelled' });
     }
+    invalidateOrgStatusCache(org_id);
 
     setImmediate(() => {
       logAudit({
@@ -537,6 +539,96 @@ const getAccountHealthSummary = async (req, res) => {
   }
 };
 
+// ── 11. Owner dashboard stats (platform-wide KPIs) ────────────────────────────
+
+const getOwnerDashboardStats = async (req, res) => {
+  try {
+    if (!requireSuperadmin(req, res)) return;
+
+    // Org counts by status
+    const orgRows = await db('edx_organizations')
+      .groupBy('status')
+      .select('status', db.raw('COUNT(id) as cnt'));
+    const orgs = { total: 0, active: 0, trial: 0, suspended: 0, cancelled: 0 };
+    for (const row of orgRows) {
+      const cnt = parseInt(row.cnt || 0);
+      orgs.total += cnt;
+      if (orgs[row.status] !== undefined) orgs[row.status] = cnt;
+    }
+
+    // Latest subscription per org (same pattern as getAccountHealthSummary)
+    const latestSubRef = () =>
+      db('edx_subscriptions')
+        .select('org_id')
+        .max('id as sub_id')
+        .groupBy('org_id')
+        .as('latest_sub_ref');
+
+    // MRR = sum of plan prices over billable latest subscriptions
+    const mrrRow = await db('edx_subscriptions as s')
+      .join(latestSubRef(), 'latest_sub_ref.sub_id', 's.id')
+      .join('edx_plans as p', 's.plan_id', 'p.id')
+      .whereIn('s.status', ['active', 'trial'])
+      .sum('p.price_per_month as mrr')
+      .first();
+
+    // Invoice totals by status (+ effective overdue: Sent past due date)
+    const invoiceRows = await db('edx_saas_invoices')
+      .groupBy('status')
+      .select('status', db.raw('COUNT(id) as cnt'), db.raw('SUM(amount) as total'));
+    const invoices = {};
+    for (const row of invoiceRows) {
+      invoices[row.status.toLowerCase()] = {
+        count: parseInt(row.cnt || 0),
+        amount: parseFloat(row.total || 0),
+      };
+    }
+    const overdueRow = await db('edx_saas_invoices')
+      .where(function () {
+        this.where('status', 'Overdue')
+          .orWhere(function () {
+            this.where('status', 'Sent').where('due_date', '<', db.fn.now());
+          });
+      })
+      .select(db.raw('COUNT(id) as cnt'), db.raw('SUM(amount) as total'))
+      .first();
+
+    // Subscriptions expiring within 30 days
+    const expiring = await db('edx_subscriptions as s')
+      .join(latestSubRef(), 'latest_sub_ref.sub_id', 's.id')
+      .join('edx_organizations as o', 's.org_id', 'o.id')
+      .leftJoin('edx_plans as p', 's.plan_id', 'p.id')
+      .whereIn('s.status', ['active', 'trial'])
+      .whereNotNull('s.expires_on')
+      .whereRaw('s.expires_on BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 30 DAY)')
+      .select('o.id as org_id', 'o.name as org_name', 'p.name as plan_name',
+              's.status as sub_status', 's.expires_on')
+      .orderBy('s.expires_on', 'asc');
+
+    // Recent signups
+    const recentSignups = await db('edx_organizations as o')
+      .leftJoin('edx_plans as p', 'o.plan_id', 'p.id')
+      .select('o.id', 'o.name', 'o.slug', 'o.status', 'o.created_on', 'p.name as plan_name')
+      .orderBy('o.id', 'desc')
+      .limit(5);
+
+    res.json({
+      orgs,
+      mrr: parseFloat(mrrRow?.mrr || 0),
+      invoices: {
+        by_status: invoices,
+        overdue_count: parseInt(overdueRow?.cnt || 0),
+        overdue_amount: parseFloat(overdueRow?.total || 0),
+      },
+      expiring_30d: expiring,
+      recent_signups: recentSignups,
+    });
+  } catch (err) {
+    logger.error(`[saasAccounts] getOwnerDashboardStats error: ${err.message}`);
+    res.status(500).json({ message: 'Failed to fetch dashboard stats.' });
+  }
+};
+
 module.exports = {
   checkSlugAvailable,
   checkEmailAvailable,
@@ -548,4 +640,5 @@ module.exports = {
   getSaasInvoices,
   markSaasInvoicePaid,
   getAccountHealthSummary,
+  getOwnerDashboardStats,
 };

@@ -14,5 +14,6 @@ router.post(  '/saas/generateSaasInvoice',          auth, requireOwner, ctrl.gen
 router.get(   '/saas/getSaasInvoices',              auth, requireOwner, ctrl.getSaasInvoices);
 router.patch( '/saas/markSaasInvoicePaid',          auth, requireOwner, ctrl.markSaasInvoicePaid);
 router.get(   '/saas/getAccountHealthSummary',      auth, requireOwner, ctrl.getAccountHealthSummary);
+router.get(   '/saas/getOwnerDashboardStats',       auth, requireOwner, ctrl.getOwnerDashboardStats);
 
 module.exports = router;

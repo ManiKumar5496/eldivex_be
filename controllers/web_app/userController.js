@@ -180,7 +180,12 @@ const loginUsers = async (req, res) => {
       .first();
 
     if (!org) return res.status(404).json({ message: "Organization not found" });
-    if (org.status !== 'active') return res.status(403).json({ message: "Organization account is not active" });
+    if (org.status !== 'active' && org.status !== 'trial') {
+      return res.status(403).json({
+        code: 'ORG_SUSPENDED',
+        message: 'Your organisation account has been suspended. Please contact support.',
+      });
+    }
 
     // 2. Find or create client user scoped to this org
     const result = await getUsers.upsertUserToken(phone_number, parsedOrgId);
@@ -227,6 +232,20 @@ const loginWebUsers = async (req, res) => {
       const user_name=users.user_name
       const branch_access = users.user_branch_access
       const org_id = users.org_id ?? 1
+
+      // Org kill-switch: non-owner users of a suspended/cancelled org cannot log in
+      if (role_id !== 1 && role_id !== '1') {
+        const org = await db('edx_organizations')
+          .where({ id: org_id })
+          .select('status')
+          .first();
+        if (org && ['suspended', 'cancelled'].includes(org.status)) {
+          return res.status(403).json({
+            code: 'ORG_SUSPENDED',
+            message: 'Your organisation account has been suspended. Please contact support.',
+          });
+        }
+      }
      
       const docUrl = process.env.DOC_FOLDER_URL
       const folderName = folderMapper.fetchFolderName("user_image");

@@ -29,6 +29,16 @@ const LOGIN_ALLOWED_STATUSES = [2, 5, 6];
 const normalisePhone = (raw) =>
   String(raw || '').replace(/^\+?91/, '').replace(/\D/g, '').slice(-10);
 
+// Org kill-switch: suspended/cancelled orgs cannot use the caregiver portal.
+const ORG_SUSPENDED_RESPONSE = {
+  code: 'ORG_SUSPENDED',
+  message: 'Your organisation account has been suspended. Please contact support.',
+};
+const isOrgBlocked = async (orgId) => {
+  const org = await db('edx_organizations').where({ id: orgId }).first('status');
+  return !org || !['active', 'trial'].includes(org.status);
+};
+
 // Match an HP by the last 10 digits of their stored phone, scoped to one org.
 const findHpByPhone = (orgId, phone10) =>
   db('edx_hp_registration')
@@ -53,7 +63,7 @@ const getOrgBySlug = async (req, res) => {
       .where({ slug })
       .first('id', 'name', 'slug', 'status');
 
-    if (!org || org.status !== 'active') {
+    if (!org || !['active', 'trial'].includes(org.status)) {
       return res.status(404).json({ message: 'Organisation not found.' });
     }
 
@@ -74,7 +84,7 @@ const getOrgById = async (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ message: 'A valid org id is required.' });
     const org = await db('edx_organizations').where({ id }).first('id', 'name', 'slug', 'status');
-    if (!org || org.status !== 'active') return res.status(404).json({ message: 'Organisation not found.' });
+    if (!org || !['active', 'trial'].includes(org.status)) return res.status(404).json({ message: 'Organisation not found.' });
     res.json({ org_id: org.id, org_name: org.name, slug: org.slug });
   } catch (err) {
     logger.error(`Error getOrgById: ${err.message}`);
@@ -94,6 +104,8 @@ const requestOtp = async (req, res) => {
     if (!orgId || phone10.length !== 10) {
       return res.status(400).json({ message: 'A valid phone number and org_id are required.' });
     }
+
+    if (await isOrgBlocked(orgId)) return res.status(403).json(ORG_SUSPENDED_RESPONSE);
 
     const hp = await findHpByPhone(orgId, phone10);
     if (!hp) return res.status(200).json(generic); // don't reveal existence
@@ -138,6 +150,8 @@ const verifyOtp = async (req, res) => {
     if (!orgId || phone10.length !== 10 || !otp) {
       return res.status(400).json({ message: 'phone, org_id and otp are required.' });
     }
+
+    if (await isOrgBlocked(orgId)) return res.status(403).json(ORG_SUSPENDED_RESPONSE);
 
     // ── TEMPORARY (testing): accept a static OTP so the portal can be used
     // before SMS delivery is wired up. The HP must still exist and be active in

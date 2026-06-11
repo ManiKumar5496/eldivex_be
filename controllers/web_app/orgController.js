@@ -11,6 +11,8 @@ const db     = require('../../config/db');
 const logger = require('../../logger');
 const bcrypt = require('bcrypt');
 const { getCurrentDateTime } = require('../../utils/dateTime');
+const { logAudit }           = require('../../utils/auditLogger');
+const { invalidateOrgStatusCache } = require('../../middlewares/orgStatusGate');
 
 function requireSuperadmin(req, res) {
   const roleId = req.login_data?.role_id;
@@ -163,6 +165,11 @@ const updateOrganisation = async (req, res) => {
     const { id } = req.params;
     const { name, email, phone, address, status } = req.body;
 
+    const existing = await db('edx_organizations').where({ id }).first();
+    if (!existing) {
+      return res.status(404).json({ message: 'Organisation not found.' });
+    }
+
     const payload = {};
     if (name    !== undefined) payload.name    = name;
     if (email   !== undefined) payload.email   = email;
@@ -170,9 +177,18 @@ const updateOrganisation = async (req, res) => {
     if (address !== undefined) payload.address = address;
     if (status  !== undefined) payload.status  = status;
 
-    const updated = await db('edx_organizations').where({ id }).update(payload);
-    if (!updated) {
-      return res.status(404).json({ message: 'Organisation not found.' });
+    await db('edx_organizations').where({ id }).update(payload);
+
+    if (status !== undefined && status !== existing.status) {
+      invalidateOrgStatusCache(id);
+      logAudit({
+        entityType: 'ORGANISATION',
+        entityId:   Number(id),
+        action:     'STATUS_CHANGE',
+        changedBy:  req.login_data.id,
+        oldValues:  { status: existing.status },
+        newValues:  { status },
+      });
     }
 
     res.json({ message: 'Organisation updated successfully.' });

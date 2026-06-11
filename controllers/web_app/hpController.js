@@ -379,9 +379,9 @@ const getPendingPayouts = async (req, res) => {
  */
 const createPayout = async (req, res) => {
   try {
-    const { hp_unique_id, booking_id, period_from, period_to, pay_amount, payment_mode = 'Cash' } = req.body;
+    const { hp_unique_id, booking_id, period_from, period_to, pay_amount, gross_pay, hostel_deduction, payment_mode = 'Cash' } = req.body;
 
-    if (!hp_unique_id || !pay_amount) {
+    if (!hp_unique_id || pay_amount == null) {
       return res.status(400).json({ message: 'hp_unique_id and pay_amount are required.' });
     }
 
@@ -391,6 +391,8 @@ const createPayout = async (req, res) => {
       period_from:  period_from  || null,
       period_to:    period_to    || null,
       pay_amount:   Number(pay_amount),
+      gross_pay:    gross_pay != null ? Number(gross_pay) : null,
+      hostel_deduction: hostel_deduction != null ? Number(hostel_deduction) : 0,
       payment_mode,
       status:       'Pending',
       created_by:   req.login_data.id,

@@ -43,4 +43,47 @@ router.get('/getAuditTrail', auth, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/saas/getOwnerAuditTrail — owner only, cross-org.
+ * Filters: org_id, entity_type, action, from, to (created_on date range), page.
+ */
+const requireOwner = require('../middlewares/requireOwner');
+
+router.get('/saas/getOwnerAuditTrail', auth, requireOwner, async (req, res) => {
+  try {
+    const { org_id, entity_type, action, from, to } = req.query;
+    const page   = Math.max(1, parseInt(req.query.page) || 1);
+    const limit  = 50;
+    const offset = (page - 1) * limit;
+
+    let query = db('edx_audit_log as a')
+      .leftJoin('edx_organizations as o', 'a.org_id', 'o.id')
+      .orderBy('a.created_on', 'desc');
+
+    if (org_id)      query = query.where('a.org_id', parseInt(org_id));
+    if (entity_type) query = query.where('a.entity_type', entity_type);
+    if (action)      query = query.where('a.action', action);
+    if (from)        query = query.where('a.created_on', '>=', from);
+    if (to)          query = query.where('a.created_on', '<=', `${to} 23:59:59`);
+
+    const [rows, countResult] = await Promise.all([
+      query.clone()
+        .select('a.*', 'o.name as org_name')
+        .limit(limit)
+        .offset(offset),
+      query.clone().clearSelect().clearOrder().count('* as total').first(),
+    ]);
+
+    res.json({
+      data:  rows,
+      total: Number(countResult?.total ?? 0),
+      page,
+      limit,
+    });
+  } catch (error) {
+    logger.error('[auditRoutes] getOwnerAuditTrail error:', error);
+    res.status(500).json({ message: 'Failed to fetch audit trail.', details: error.message });
+  }
+});
+
 module.exports = router;
