@@ -13,6 +13,7 @@ const db = require('../../config/db');
 const bcrypt = require('bcrypt');
 const logger = require('../../logger');
 const { generateClientToken } = require('../../utils/jwt');
+const { resolveOrgId } = require('../../utils/orgCode');
 const { getCurrentDateTime } = require('../../utils/dateTime');
 const { sendOTP } = require('../../utils/smsService');
 
@@ -42,7 +43,8 @@ const findClientByPhone = (orgId, phone10) =>
 const requestOtp = async (req, res) => {
   const generic = { message: 'If that number is registered, an OTP has been sent.' };
   try {
-    const orgId = parseInt(req.body.org_id, 10);
+    // Numeric id (legacy orgs) or org code (new orgs).
+    const orgId = await resolveOrgId(db, req.body.org_id);
     const phone10 = normalisePhone(req.body.phone);
     if (!orgId || phone10.length !== 10) {
       return res.status(400).json({ message: 'A valid phone number and org_id are required.' });
@@ -74,7 +76,7 @@ const requestOtp = async (req, res) => {
 
 const verifyOtp = async (req, res) => {
   try {
-    const orgId = parseInt(req.body.org_id, 10);
+    const orgId = await resolveOrgId(db, req.body.org_id);
     const phone10 = normalisePhone(req.body.phone);
     const otp = String(req.body.otp || '').trim();
     if (!orgId || phone10.length !== 10 || !otp) {

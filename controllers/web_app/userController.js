@@ -12,6 +12,7 @@ const { getCurrentDateTime } = require("../../utils/dateTime");
 const { sendEmail } = require('../../utils/emailService');
 const { passwordResetLink } = require('../../utils/emailTemplates');
 const { withOrg, getOrgId } = require('../../utils/orgScope');
+const { resolveOrgId } = require('../../utils/orgCode');
 
 
 const getUserDetails = async (req, res) =>  {
@@ -169,8 +170,9 @@ const loginUsers = async (req, res) => {
   if (!phone_number) return res.status(400).json({ message: "Phone number is required" });
   if (!org_id) return res.status(400).json({ message: "Organization ID is required" });
 
-  const parsedOrgId = parseInt(org_id, 10);
-  if (isNaN(parsedOrgId)) return res.status(400).json({ message: "Organization ID must be a number" });
+  // Numeric id (legacy orgs) or org code like SUN-482913 (new orgs).
+  const parsedOrgId = await resolveOrgId(db, org_id);
+  if (!parsedOrgId) return res.status(400).json({ message: "Invalid Organization ID" });
 
   try {
     // 1. Validate org exists and is active
@@ -238,7 +240,7 @@ const loginWebUsers = async (req, res) => {
       // role 1 "Super Admin" is just a tenant role.
       const org = await db('edx_organizations')
         .where({ id: org_id })
-        .select('status')
+        .select('status', 'org_code')
         .first();
       if (org && ['suspended', 'cancelled'].includes(org.status)) {
         return res.status(403).json({
@@ -268,7 +270,7 @@ const loginWebUsers = async (req, res) => {
       // (you can add extra validation like OTP here)
       const token = generateToken(users);
       // console.log(token)
-      return res.status(200).json({ message: 'Login successful', token, role_id, userId, user_name, user_image, branch_access, org_id });
+      return res.status(200).json({ message: 'Login successful', token, role_id, userId, user_name, user_image, branch_access, org_id, org_code: org?.org_code ?? null });
 
   } catch (err) {
     console.error('❌ Controller error:', err.message);

@@ -17,6 +17,7 @@ const db = require('../../config/db');
 const bcrypt = require('bcrypt');
 const logger = require('../../logger');
 const { generateHpToken } = require('../../utils/jwt');
+const { resolveOrgId } = require('../../utils/orgCode');
 const { getCurrentDateTime } = require('../../utils/dateTime');
 const { sendOTP } = require('../../utils/smsService');
 
@@ -61,13 +62,13 @@ const getOrgBySlug = async (req, res) => {
 
     const org = await db('edx_organizations')
       .where({ slug })
-      .first('id', 'name', 'slug', 'status');
+      .first('id', 'org_code', 'name', 'slug', 'status');
 
     if (!org || !['active', 'trial'].includes(org.status)) {
       return res.status(404).json({ message: 'Organisation not found.' });
     }
 
-    res.json({ org_id: org.id, org_name: org.name, slug: org.slug });
+    res.json({ org_id: org.id, org_code: org.org_code, org_name: org.name, slug: org.slug });
   } catch (err) {
     logger.error(`Error getOrgBySlug: ${err.message}`);
     res.status(500).json({ message: 'Error resolving organisation.' });
@@ -77,15 +78,16 @@ const getOrgBySlug = async (req, res) => {
 /**
  * GET /api/org/byId/:id — public.
  * Lets a caregiver link that carries org_id (instead of a slug) still show the
- * organisation name on the login screen.
+ * organisation name on the login screen. Accepts a numeric id (legacy orgs)
+ * or an org code like SUN-482913 (orgs created after the code rollout).
  */
 const getOrgById = async (req, res) => {
   try {
-    const id = parseInt(req.params.id, 10);
+    const id = await resolveOrgId(db, req.params.id);
     if (!id) return res.status(400).json({ message: 'A valid org id is required.' });
-    const org = await db('edx_organizations').where({ id }).first('id', 'name', 'slug', 'status');
+    const org = await db('edx_organizations').where({ id }).first('id', 'org_code', 'name', 'slug', 'status');
     if (!org || !['active', 'trial'].includes(org.status)) return res.status(404).json({ message: 'Organisation not found.' });
-    res.json({ org_id: org.id, org_name: org.name, slug: org.slug });
+    res.json({ org_id: org.id, org_code: org.org_code, org_name: org.name, slug: org.slug });
   } catch (err) {
     logger.error(`Error getOrgById: ${err.message}`);
     res.status(500).json({ message: 'Error resolving organisation.' });
@@ -98,7 +100,8 @@ const getOrgById = async (req, res) => {
 const requestOtp = async (req, res) => {
   const generic = { message: 'If that number is registered, an OTP has been sent.' };
   try {
-    const orgId = parseInt(req.body.org_id, 10);
+    // Numeric id (legacy orgs) or org code (new orgs).
+    const orgId = await resolveOrgId(db, req.body.org_id);
     const phone10 = normalisePhone(req.body.phone);
 
     if (!orgId || phone10.length !== 10) {
@@ -143,7 +146,7 @@ const requestOtp = async (req, res) => {
  */
 const verifyOtp = async (req, res) => {
   try {
-    const orgId = parseInt(req.body.org_id, 10);
+    const orgId = await resolveOrgId(db, req.body.org_id);
     const phone10 = normalisePhone(req.body.phone);
     const otp = String(req.body.otp || '').trim();
 

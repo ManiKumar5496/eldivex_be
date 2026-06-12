@@ -12,6 +12,7 @@ const logger = require('../../logger');
 const bcrypt = require('bcrypt');
 const { getCurrentDateTime } = require('../../utils/dateTime');
 const { logAudit }           = require('../../utils/auditLogger');
+const { generateOrgCode }    = require('../../utils/orgCode');
 const { invalidateOrgStatusCache } = require('../../middlewares/orgStatusGate');
 
 function requireSuperadmin(req, res) {
@@ -43,6 +44,7 @@ const getOrganisations = async (req, res) => {
       .leftJoin('edx_plans as p', 's.plan_id', 'p.id')
       .select(
         'o.id',
+        'o.org_code',
         'o.name',
         'o.slug',
         'o.email',
@@ -105,10 +107,15 @@ const createOrganisation = async (req, res) => {
       });
     }
 
+    // Public org code (e.g. SUN-482913) — what users see and log in with.
+    // Pre-existing orgs have org_code = NULL and keep using their numeric id.
+    const org_code = await generateOrgCode(db, name);
+
     // Create org
     const [org_id] = await db('edx_organizations').insert({
       name,
       slug,
+      org_code,
       email:    email   || null,
       phone:    phone   || null,
       address:  address || null,
@@ -209,6 +216,7 @@ const getOrgDetails = async (req, res) => {
       .where('o.id', orgId)
       .select(
         'o.id',
+        'o.org_code',
         'o.name',
         'o.slug',
         'o.email',
