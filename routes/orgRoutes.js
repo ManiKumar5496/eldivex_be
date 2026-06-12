@@ -1,6 +1,6 @@
 /**
  * orgRoutes.js — Phase 5.4
- * All routes require owner access (role_id === 1).
+ * All routes require owner access (is_owner JWT claim from /ownerLogin).
  */
 
 const express        = require('express');

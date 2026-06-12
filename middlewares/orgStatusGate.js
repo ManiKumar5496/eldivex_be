@@ -12,7 +12,8 @@
  *
  * Bypasses:
  *  - no/invalid token (public routes; route auth handles the rest)
- *  - platform owner (role_id === 1)
+ *  - platform owner (is_owner JWT claim from /ownerLogin — NOT role_id;
+ *    "Super Admin" role 1 is just the eldivex_web tenant's admin role)
  *  - login/public paths (their controllers do their own org-status checks,
  *    and a stale token in the header must not block a fresh login)
  *
@@ -34,6 +35,7 @@ const BLOCKED_STATUSES = ['suspended', 'cancelled'];
 // Public / login path prefixes the gate must never block.
 const SKIP_PREFIXES = [
   '/loginWeb',
+  '/ownerLogin',
   '/login',
   '/forgotPassword',
   '/resetPassword',
@@ -83,8 +85,9 @@ const orgStatusGate = async (req, res, next) => {
       return next(); // invalid/expired — route auth produces the proper error
     }
 
-    // Platform owner is never gated
-    if (decoded.role_id === 1 || decoded.role_id === '1') return next();
+    // Platform owner is never gated (is_owner claim only — tenant roles,
+    // including role 1 "Super Admin" of eldivex_web, are all gated)
+    if (decoded.is_owner === true) return next();
 
     const orgId = Number(decoded.org_id ?? 1);
     const status = await getOrgStatus(orgId);

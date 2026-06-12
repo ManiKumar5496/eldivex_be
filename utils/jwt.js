@@ -19,6 +19,18 @@ exports.generateToken = (user) => {
     return token;
   };
 
+// Platform-owner token. The is_owner claim — not role_id — is what grants
+// owner-platform access (requireOwner) and exemption from orgStatusGate.
+// Tenant tokens never carry it: generateToken above cannot produce one.
+const OWNER_EXPIRY = process.env.OWNER_JWT_EXPIRES_IN || '7d';
+
+exports.generateOwnerToken = () =>
+  jwt.sign(
+    { id: 0, user_name: 'Owner', is_owner: true, org_id: 1, branch_access: 'all' },
+    SECRET,
+    { expiresIn: OWNER_EXPIRY }
+  );
+
 // Caregiver (Health Professional) self-service token.
 // Carries role:'caregiver' + hp_id + org_id. The hpAuth middleware derives the
 // caregiver's identity ONLY from these claims — never from the request body —

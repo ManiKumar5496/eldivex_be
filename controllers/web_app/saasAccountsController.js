@@ -31,9 +31,9 @@ const ALLOWED_TRANSITIONS = {
 };
 
 function requireSuperadmin(req, res) {
-  const roleId = req.login_data?.role_id;
-  if (roleId !== 1 && roleId !== '1') {
-    res.status(403).json({ message: 'Superadmin access required.' });
+  // Owner = is_owner JWT claim from /ownerLogin, never a tenant role.
+  if (req.login_data?.is_owner !== true) {
+    res.status(403).json({ message: 'Owner access required.' });
     return false;
   }
   return true;

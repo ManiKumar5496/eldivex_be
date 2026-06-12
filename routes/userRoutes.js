@@ -1,6 +1,7 @@
 const express = require('express');
 const router  = express.Router();
 const userController = require('../controllers/web_app/userController');
+const ownerAuthController = require('../controllers/web_app/ownerAuthController');
 const upload  = require('../middlewares/upload');
 const auth    = require('../middlewares/auth');
 const { authLimiter } = require('../middlewares/rateLimiter');
@@ -9,6 +10,7 @@ const { loginWebSchema, createUserSchema, forgotPasswordSchema, resetPasswordSch
 
 // ── Auth endpoints — strict rate limit ───────────────────────────────────────
 router.post('/loginWeb',       authLimiter, validate(loginWebSchema),       userController.loginWebUsers);
+router.post('/ownerLogin',     authLimiter, ownerAuthController.ownerLogin);
 router.post('/login',          authLimiter, userController.loginUsers);
 router.post('/forgotPassword', validate(forgotPasswordSchema), userController.forgotPassword);
 router.post('/resetPassword',  validate(resetPasswordSchema),  userController.resetPassword);

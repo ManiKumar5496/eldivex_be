@@ -233,18 +233,18 @@ const loginWebUsers = async (req, res) => {
       const branch_access = users.user_branch_access
       const org_id = users.org_id ?? 1
 
-      // Org kill-switch: non-owner users of a suspended/cancelled org cannot log in
-      if (role_id !== 1 && role_id !== '1') {
-        const org = await db('edx_organizations')
-          .where({ id: org_id })
-          .select('status')
-          .first();
-        if (org && ['suspended', 'cancelled'].includes(org.status)) {
-          return res.status(403).json({
-            code: 'ORG_SUSPENDED',
-            message: 'Your organisation account has been suspended. Please contact support.',
-          });
-        }
+      // Org kill-switch: no user of a suspended/cancelled org can log in.
+      // No role exemption — the platform owner has a separate /ownerLogin and
+      // role 1 "Super Admin" is just a tenant role.
+      const org = await db('edx_organizations')
+        .where({ id: org_id })
+        .select('status')
+        .first();
+      if (org && ['suspended', 'cancelled'].includes(org.status)) {
+        return res.status(403).json({
+          code: 'ORG_SUSPENDED',
+          message: 'Your organisation account has been suspended. Please contact support.',
+        });
       }
      
       const docUrl = process.env.DOC_FOLDER_URL
