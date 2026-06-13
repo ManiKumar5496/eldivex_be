@@ -20,6 +20,7 @@ const logger = require('../../logger');
 const { getCurrentDateTime } = require('../../utils/dateTime');
 const { logAudit }           = require('../../utils/auditLogger');
 const { invalidateOrgStatusCache } = require('../../middlewares/orgStatusGate');
+const { orgStatusForSubscription } = require('../../utils/orgStatus');
 
 // ── Allowed subscription status transitions ───────────────────────────────────
 const ALLOWED_TRANSITIONS = {
@@ -205,16 +206,14 @@ const transitionSubscriptionStatus = async (req, res) => {
         updated_on: getCurrentDateTime(),
       });
 
-    // If reactivating, also update org status
-    if (new_status === 'active') {
-      await db('edx_organizations').where('id', org_id).update({ status: 'active' });
-    }
-    if (new_status === 'suspended') {
-      await db('edx_organizations').where('id', org_id).update({ status: 'suspended' });
-    }
-    if (new_status === 'cancelled') {
-      await db('edx_organizations').where('id', org_id).update({ status: 'cancelled' });
-    }
+    // Keep the org row in lock-step with the subscription so the kill-switch
+    // every login reads is never stale. Always sync — a partial mapping is
+    // what let a reactivated org's caregivers/clients stay locked out while
+    // the super-admin got back in. ('expired' has no org enum value, so it
+    // maps to 'suspended' and blocks everyone.)
+    await db('edx_organizations')
+      .where('id', org_id)
+      .update({ status: orgStatusForSubscription(new_status) });
     invalidateOrgStatusCache(org_id);
 
     setImmediate(() => {

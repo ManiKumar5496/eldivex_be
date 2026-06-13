@@ -97,7 +97,7 @@ async function getModulesData()
 
 
 async function getRolesModel(filters = {}) {
-  const { id } = filters;
+  const { id, org_id } = filters;
 
   let data = db('edx_web_emp_roles as r')
     .leftJoin('edx_web_module as m', function () {
@@ -116,6 +116,7 @@ async function getRolesModel(filters = {}) {
     .groupBy('r.id');
 
     if (id) data.where('r.id', id);
+    if (org_id) data.where('r.org_id', org_id);
 
     return data;
 

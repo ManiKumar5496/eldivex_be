@@ -13,6 +13,7 @@ const { sendEmail } = require('../../utils/emailService');
 const { passwordResetLink } = require('../../utils/emailTemplates');
 const { withOrg, getOrgId } = require('../../utils/orgScope');
 const { resolveOrgId } = require('../../utils/orgCode');
+const { isOrgLoginBlocked, ORG_SUSPENDED_RESPONSE } = require('../../utils/orgStatus');
 
 
 const getUserDetails = async (req, res) =>  {
@@ -182,11 +183,8 @@ const loginUsers = async (req, res) => {
       .first();
 
     if (!org) return res.status(404).json({ message: "Organization not found" });
-    if (org.status !== 'active' && org.status !== 'trial') {
-      return res.status(403).json({
-        code: 'ORG_SUSPENDED',
-        message: 'Your organisation account has been suspended. Please contact support.',
-      });
+    if (isOrgLoginBlocked(org.status)) {
+      return res.status(403).json(ORG_SUSPENDED_RESPONSE);
     }
 
     // 2. Find or create client user scoped to this org
@@ -242,11 +240,8 @@ const loginWebUsers = async (req, res) => {
         .where({ id: org_id })
         .select('status', 'org_code')
         .first();
-      if (org && ['suspended', 'cancelled'].includes(org.status)) {
-        return res.status(403).json({
-          code: 'ORG_SUSPENDED',
-          message: 'Your organisation account has been suspended. Please contact support.',
-        });
+      if (org && isOrgLoginBlocked(org.status)) {
+        return res.status(403).json(ORG_SUSPENDED_RESPONSE);
       }
      
       const docUrl = process.env.DOC_FOLDER_URL

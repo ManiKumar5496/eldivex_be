@@ -136,12 +136,26 @@ const createOrganisation = async (req, res) => {
 
     // Optionally create an admin user for the new org
     if (admin_email && admin_password) {
+      // Each org gets its own Super Admin role (scoped to this org_id) with full
+      // module access — never reuse the global role id 1, which belongs to org 1.
+      const mods = await db('edx_web_module').select('id');
+      const accessList = mods.map((m) => m.id).join(','); // comma-separated for FIND_IN_SET
+
+      const [adminRoleId] = await db('edx_web_emp_roles').insert({
+        role_name:   'Super Admin',
+        access_list: accessList,   // every module id → full side-panel access
+        status:      1,
+        org_id,                    // the org we just created
+        created_by:  req.login_data.id,
+        created_on:  getCurrentDateTime(),
+      });
+
       const hashed = await bcrypt.hash(admin_password, 10);
       await db('edx_web_app_users').insert({
         user_name:          admin_name || 'Admin',
         user_email:         admin_email,
         user_password:      hashed,
-        user_role:          2,           // org-admin (not superadmin)
+        user_role:          adminRoleId, // this org's own Super Admin role
         user_mobile:        null,
         user_gender:        null,
         user_home_branch:   null,

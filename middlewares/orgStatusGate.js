@@ -25,12 +25,11 @@
 const jwt    = require('jsonwebtoken');
 const db     = require('../config/db');
 const logger = require('../logger');
+const { isOrgLoginBlocked, ORG_SUSPENDED_RESPONSE } = require('../utils/orgStatus');
 require('dotenv').config();
 
 const JWT_TOKEN_KEY = process.env.JWT_TOKEN_KEY;
 const CACHE_TTL_MS  = 60 * 1000;
-
-const BLOCKED_STATUSES = ['suspended', 'cancelled'];
 
 // Public / login path prefixes the gate must never block.
 const SKIP_PREFIXES = [
@@ -92,11 +91,10 @@ const orgStatusGate = async (req, res, next) => {
     const orgId = Number(decoded.org_id ?? 1);
     const status = await getOrgStatus(orgId);
 
-    if (status && BLOCKED_STATUSES.includes(status)) {
-      return res.status(403).json({
-        code: 'ORG_SUSPENDED',
-        message: 'Your organisation account has been suspended. Please contact support.',
-      });
+    // `status &&` keeps the fail-open: an unknown org (null) is never blocked
+    // here — its route's own auth handles it.
+    if (status && isOrgLoginBlocked(status)) {
+      return res.status(403).json(ORG_SUSPENDED_RESPONSE);
     }
 
     next();

@@ -14,6 +14,7 @@ const bcrypt = require('bcrypt');
 const logger = require('../../logger');
 const { generateClientToken } = require('../../utils/jwt');
 const { resolveOrgId } = require('../../utils/orgCode');
+const { isOrgLoginBlocked, ORG_SUSPENDED_RESPONSE } = require('../../utils/orgStatus');
 const { getCurrentDateTime } = require('../../utils/dateTime');
 const { sendOTP } = require('../../utils/smsService');
 
@@ -22,14 +23,11 @@ const isDev = process.env.NODE_ENV !== 'production';
 const normalisePhone = (raw) =>
   String(raw || '').replace(/^\+?91/, '').replace(/\D/g, '').slice(-10);
 
-// Org kill-switch: suspended/cancelled orgs cannot use the client portal.
-const ORG_SUSPENDED_RESPONSE = {
-  code: 'ORG_SUSPENDED',
-  message: 'Your organisation account has been suspended. Please contact support.',
-};
+// Org kill-switch: only active/trial orgs may use the client portal.
+// Shares the rule with every other login path (utils/orgStatus).
 const isOrgBlocked = async (orgId) => {
   const org = await db('edx_organizations').where({ id: orgId }).first('status');
-  return !org || !['active', 'trial'].includes(org.status);
+  return !org || isOrgLoginBlocked(org.status);
 };
 
 // Match an active client by the last 10 digits of their phone, scoped to one org.

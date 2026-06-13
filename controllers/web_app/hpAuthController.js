@@ -18,6 +18,7 @@ const bcrypt = require('bcrypt');
 const logger = require('../../logger');
 const { generateHpToken } = require('../../utils/jwt');
 const { resolveOrgId } = require('../../utils/orgCode');
+const { isOrgLoginBlocked, ORG_SUSPENDED_RESPONSE } = require('../../utils/orgStatus');
 const { getCurrentDateTime } = require('../../utils/dateTime');
 const { sendOTP } = require('../../utils/smsService');
 
@@ -30,14 +31,11 @@ const LOGIN_ALLOWED_STATUSES = [2, 5, 6];
 const normalisePhone = (raw) =>
   String(raw || '').replace(/^\+?91/, '').replace(/\D/g, '').slice(-10);
 
-// Org kill-switch: suspended/cancelled orgs cannot use the caregiver portal.
-const ORG_SUSPENDED_RESPONSE = {
-  code: 'ORG_SUSPENDED',
-  message: 'Your organisation account has been suspended. Please contact support.',
-};
+// Org kill-switch: only active/trial orgs may use the caregiver portal.
+// Shares the rule with every other login path (utils/orgStatus).
 const isOrgBlocked = async (orgId) => {
   const org = await db('edx_organizations').where({ id: orgId }).first('status');
-  return !org || !['active', 'trial'].includes(org.status);
+  return !org || isOrgLoginBlocked(org.status);
 };
 
 // Match an HP by the last 10 digits of their stored phone, scoped to one org.
@@ -64,7 +62,9 @@ const getOrgBySlug = async (req, res) => {
       .where({ slug })
       .first('id', 'org_code', 'name', 'slug', 'status');
 
-    if (!org || !['active', 'trial'].includes(org.status)) {
+    // 404 (not 403) on a blocked org: the public resolver must not reveal that
+    // a suspended org exists.
+    if (!org || isOrgLoginBlocked(org.status)) {
       return res.status(404).json({ message: 'Organisation not found.' });
     }
 
@@ -86,7 +86,7 @@ const getOrgById = async (req, res) => {
     const id = await resolveOrgId(db, req.params.id);
     if (!id) return res.status(400).json({ message: 'A valid org id is required.' });
     const org = await db('edx_organizations').where({ id }).first('id', 'org_code', 'name', 'slug', 'status');
-    if (!org || !['active', 'trial'].includes(org.status)) return res.status(404).json({ message: 'Organisation not found.' });
+    if (!org || isOrgLoginBlocked(org.status)) return res.status(404).json({ message: 'Organisation not found.' });
     res.json({ org_id: org.id, org_code: org.org_code, org_name: org.name, slug: org.slug });
   } catch (err) {
     logger.error(`Error getOrgById: ${err.message}`);

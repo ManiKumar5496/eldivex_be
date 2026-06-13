@@ -50,7 +50,7 @@ const getLangC = async (req, res) =>  {
   
   const getAllRoles = async (req, res) =>  {
     try {
-      const filters = req.query;
+      const filters = { ...req.query, org_id: getOrgId(req) };
       const roles = await getMasterData.getRolesModel(filters);
       // console.log('Fetched roles:', roles); // ✅ See what's returned
       res.json(roles); // Send plain array of roles
