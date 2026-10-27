@@ -90,4 +90,24 @@ describe('envValidator', () => {
     });
     expect(exitCalled).toBe(false);
   });
+
+  test('fails when EXPOSE_DEV_OTP=true in production', () => {
+    const { exitCalled, errorOutput } = runWithEnv({
+      JWT_TOKEN_KEY: 'a'.repeat(64),
+      DB_HOST: 'localhost', DB_USER: 'root', DB_NAME: 'testdb',
+      NODE_ENV: 'production', EXPOSE_DEV_OTP: 'true',
+    });
+    expect(exitCalled).toBe(true);
+    expect(errorOutput).toMatch(/EXPOSE_DEV_OTP/);
+  });
+
+  test('fails on a non-boolean feature flag', () => {
+    const { exitCalled, errorOutput } = runWithEnv({
+      JWT_TOKEN_KEY: 'a'.repeat(64),
+      DB_HOST: 'localhost', DB_USER: 'root', DB_NAME: 'testdb',
+      NODE_ENV: 'development', FORCE_HTTPS: 'yes',
+    });
+    expect(exitCalled).toBe(true);
+    expect(errorOutput).toMatch(/FORCE_HTTPS/);
+  });
 });

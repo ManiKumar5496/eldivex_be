@@ -88,7 +88,9 @@ const orgStatusGate = async (req, res, next) => {
     // including role 1 "Super Admin" of eldivex_web, are all gated)
     if (decoded.is_owner === true) return next();
 
-    const orgId = Number(decoded.org_id ?? 1);
+    // No org claim → nothing to gate here; the route's own auth rejects it.
+    if (!decoded.org_id) return next();
+    const orgId = Number(decoded.org_id);
     const status = await getOrgStatus(orgId);
 
     // `status &&` keeps the fail-open: an unknown org (null) is never blocked

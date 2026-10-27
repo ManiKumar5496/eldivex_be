@@ -21,6 +21,8 @@ const { getCurrentDateTime } = require('../../utils/dateTime');
 const { logAudit }           = require('../../utils/auditLogger');
 const { invalidateOrgStatusCache } = require('../../middlewares/orgStatusGate');
 const { orgStatusForSubscription } = require('../../utils/orgStatus');
+const withTransaction = require('../../utils/withTransaction');
+const { countActiveBookings, countActiveHPs, activeBookingCountsByOrg } = require('../../utils/planUsage');
 
 // ── Allowed subscription status transitions ───────────────────────────────────
 const ALLOWED_TRANSITIONS = {
@@ -97,20 +99,8 @@ const getOrgUsage = async (req, res) => {
       .select('p.booking_limit', 'p.hp_limit', 'p.name as plan_name', 's.status', 's.expires_on')
       .first();
 
-    const bookingsUsed = await db('edx_bookings')
-      .where('org_id', org_id)
-      .whereNotIn('status', ['Cancelled'])
-      .count('id as cnt')
-      .first()
-      .then(r => parseInt(r?.cnt || 0));
-
-    const hpUsed = await db('edx_hp_registration')
-      .where('org_id', org_id)
-      .where('is_active', 1)
-      .count('id as cnt')
-      .first()
-      .then(r => parseInt(r?.cnt || 0))
-      .catch(() => 0);
+    const bookingsUsed = await countActiveBookings(org_id);
+    const hpUsed       = await countActiveHPs(org_id);
 
     const bookingLimit = sub?.booking_limit || 0;
     const hpLimit      = sub?.hp_limit      || 0;
@@ -199,32 +189,37 @@ const transitionSubscriptionStatus = async (req, res) => {
 
     const oldStatus = currentSub.status;
 
-    await db('edx_subscriptions')
-      .where('id', currentSub.id)
-      .update({
-        status:     new_status,
-        updated_on: getCurrentDateTime(),
-      });
-
-    // Keep the org row in lock-step with the subscription so the kill-switch
-    // every login reads is never stale. Always sync — a partial mapping is
-    // what let a reactivated org's caregivers/clients stay locked out while
-    // the super-admin got back in. ('expired' has no org enum value, so it
-    // maps to 'suspended' and blocks everyone.)
-    await db('edx_organizations')
-      .where('id', org_id)
-      .update({ status: orgStatusForSubscription(new_status) });
+    // Subscription + org row change together or not at all. Keeping the org
+    // row in lock-step with the subscription means the kill-switch every login
+    // reads is never stale. ('expired' has no org enum value, so it maps to
+    // 'suspended' and blocks everyone.) The update is conditional on the status
+    // we validated, so a concurrent transition cannot be overwritten.
+    const changed = await withTransaction(async (trx) => {
+      const n = await trx('edx_subscriptions')
+        .where({ id: currentSub.id, status: oldStatus })
+        .update({
+          status:     new_status,
+          updated_on: getCurrentDateTime(),
+        });
+      if (!n) return false;
+      await trx('edx_organizations')
+        .where('id', org_id)
+        .update({ status: orgStatusForSubscription(new_status) });
+      return true;
+    });
+    if (!changed) {
+      return res.status(409).json({ message: 'Subscription status changed concurrently. Reload and retry.' });
+    }
     invalidateOrgStatusCache(org_id);
 
-    setImmediate(() => {
-      logAudit({
-        entityType:  'ORGANISATION',
-        entityId:    org_id,
-        action:      'STATUS_CHANGE',
-        changedBy:   req.login_data.id,
-        oldValues:   { status: oldStatus },
-        newValues:   { status: new_status, reason },
-      });
+    logAudit({
+      entityType:  'ORGANISATION',
+      entityId:    Number(org_id),
+      action:      'STATUS_CHANGE',
+      changedBy:   req.login_data.id,
+      org_id:      Number(org_id),
+      oldValues:   { status: oldStatus },
+      newValues:   { status: new_status, reason },
     });
 
     res.json({ message: `Subscription status changed to '${new_status}'.` });
@@ -250,20 +245,8 @@ const checkDowngradeViability = async (req, res) => {
       return res.status(404).json({ message: 'Plan not found.' });
     }
 
-    const bookingsUsed = await db('edx_bookings')
-      .where('org_id', org_id)
-      .whereNotIn('status', ['Cancelled'])
-      .count('id as cnt')
-      .first()
-      .then(r => parseInt(r?.cnt || 0));
-
-    const hpUsed = await db('edx_hp_registration')
-      .where('org_id', org_id)
-      .where('is_active', 1)
-      .count('id as cnt')
-      .first()
-      .then(r => parseInt(r?.cnt || 0))
-      .catch(() => 0);
+    const bookingsUsed = await countActiveBookings(org_id);
+    const hpUsed       = await countActiveHPs(org_id);
 
     const bookingLimit = targetPlan.booking_limit || 0;
     const hpLimit      = targetPlan.hp_limit      || 0;
@@ -361,6 +344,7 @@ const generateSaasInvoice = async (req, res) => {
         entityId:   id,
         action:     'CREATE',
         changedBy:  req.login_data.id,
+        org_id:     Number(org_id),
         newValues:  { org_id, period_month, period_year, amount: invoiceAmount },
       });
     });
@@ -439,6 +423,7 @@ const markSaasInvoicePaid = async (req, res) => {
         entityId:   invoice_id,
         action:     'STATUS_CHANGE',
         changedBy:  req.login_data.id,
+        org_id:     invoice.org_id,
         oldValues:  { status: invoice.status },
         newValues:  { status: 'Paid', transaction_ref },
       });
@@ -481,15 +466,7 @@ const getAccountHealthSummary = async (req, res) => {
       );
 
     // Fetch booking counts per org
-    const bookingCounts = await db('edx_bookings')
-      .whereNotIn('status', ['Cancelled'])
-      .groupBy('org_id')
-      .select('org_id', db.raw('COUNT(id) as cnt'));
-
-    const bookingMap = {};
-    for (const row of bookingCounts) {
-      bookingMap[row.org_id] = parseInt(row.cnt || 0);
-    }
+    const bookingMap = await activeBookingCountsByOrg();
 
     const now = new Date();
 

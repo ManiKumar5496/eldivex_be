@@ -75,6 +75,7 @@ function chain(value) {
     groupBy:    jest.fn().mockReturnThis(),
     sum:        jest.fn().mockReturnThis(),
     count:      jest.fn().mockReturnThis(),
+    forUpdate:  jest.fn().mockReturnThis(),
     first:      jest.fn().mockResolvedValue(value),
     insert:     jest.fn().mockResolvedValue(Array.isArray(value) ? value : [1]),
     update:     jest.fn().mockResolvedValue(1),
@@ -449,7 +450,8 @@ describe('approveWriteOff', () => {
         return chain({ total_debit: '0', total_credit: '0' });
       }
       if (tableName === 'edx_write_offs') {
-        return chain([1]);
+        // forUpdate().first() re-reads the locked row; update() resolves 1
+        return chain(pendingWo);
       }
       if (tableName === 'edx_approval_history') {
         return chain([1]);
@@ -473,6 +475,32 @@ describe('approveWriteOff', () => {
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({ status: 'Approved' })
     );
+  });
+
+  test('returns 403 when the approver created the write-off (maker-checker)', async () => {
+    db.mockReturnValueOnce(chain({ ...pendingWo, created_by: 99 }));
+
+    const res = mockRes();
+    await approveWriteOff(mockReq({ write_off_id: 55, action: 'Approved' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(withTransaction).not.toHaveBeenCalled();
+  });
+
+  test('returns 409 when a concurrent approval already processed the write-off', async () => {
+    db.mockReturnValueOnce(chain(pendingWo));
+    const trxMock = jest.fn().mockImplementation(() => chain({ ...pendingWo, status: 'Approved' }));
+    trxMock.raw = jest.fn().mockReturnValue('RAW_EXPR');
+    withTransaction.mockImplementation(async (fn) => fn(trxMock));
+
+    const res = mockRes();
+    await approveWriteOff(mockReq({ write_off_id: 55, action: 'Approved' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      error: 'Write-off was already processed.',
+      message: 'Write-off was already processed.',
+    }));
   });
 
   test('rejects write-off: updates status to Rejected without creating ledger entry', async () => {
@@ -766,6 +794,26 @@ describe('approveRefund', () => {
     );
   });
 
+  test('returns 403 when the approver requested the refund (maker-checker)', async () => {
+    db.mockReturnValueOnce(chain({ ...pendingRefund, requested_by: 99 }));
+
+    const res = mockRes();
+    await approveRefund(mockReq({ refund_id: 20, action: 'Approved' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(403);
+  });
+
+  test('returns 409 when the refund changed state concurrently', async () => {
+    const updateChain = chain(0);
+    updateChain.update = jest.fn().mockResolvedValue(0); // conditional update matched no row
+    db.mockReturnValueOnce(chain(pendingRefund)).mockReturnValueOnce(updateChain);
+
+    const res = mockRes();
+    await approveRefund(mockReq({ refund_id: 20, action: 'Approved' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+  });
+
   test('transitions PENDING_APPROVAL to Rejected', async () => {
     db.mockReturnValueOnce(chain(pendingRefund));
     db.mockReturnValueOnce(chain(1));
@@ -811,7 +859,7 @@ describe('approveRefund', () => {
         return chain({ total_debit: '0', total_credit: '0' });
       }
       if (tableName === 'edx_refunds') {
-        return chain([1]);
+        return chain(processingRefund);
       }
       if (tableName === 'edx_approval_history') {
         return chain([1]);
@@ -871,6 +919,30 @@ describe('applyCreditNote', () => {
     const res = mockRes();
     await applyCreditNote(mockReq({ credit_note_id: 5 }), res);
     expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('returns 400 when amount_to_apply is zero or negative', async () => {
+    for (const amt of [-50, '0', 'abc']) {
+      const res = mockRes();
+      await applyCreditNote(mockReq({ ...validBody, amount_to_apply: amt }), res);
+      expect(res.status).toHaveBeenCalledWith(400);
+    }
+    expect(db).not.toHaveBeenCalled();
+  });
+
+  test('returns 400 when the locked balance no longer covers the amount (race)', async () => {
+    db.mockReturnValueOnce(chain(approvedCn));
+    db.mockReturnValueOnce(chain({ id: 20 }));
+    db.mockReturnValueOnce(chain({ id: 10, user_id: 3 }));
+    const trxMock = jest.fn().mockImplementation(() => chain({ ...approvedCn, remaining_amount: '50' }));
+    trxMock.raw = jest.fn().mockReturnValue('RAW_EXPR');
+    withTransaction.mockImplementation(async (fn) => fn(trxMock));
+
+    const res = mockRes();
+    await applyCreditNote(mockReq(validBody), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ error: expect.stringContaining('exceeds credit note') }));
   });
 
   test('returns 404 when credit note not found', async () => {
@@ -957,7 +1029,7 @@ describe('applyCreditNote', () => {
         return chain({ total_debit: '0', total_credit: '0' });
       }
       if (tableName === 'edx_credit_notes') {
-        return chain(1);
+        return chain(approvedCn); // locked re-read; update() resolves 1
       }
       if (tableName === 'edx_credit_note_applications') {
         return chain([99]);
@@ -1243,7 +1315,7 @@ describe('approveInternalTransfer', () => {
         return chain({ total_debit: '0', total_credit: '0' });
       }
       if (tableName === 'edx_internal_transfers') {
-        return chain(1);
+        return chain(pendingTransfer); // locked re-read; update() resolves 1
       }
       if (tableName === 'edx_approval_history') {
         return chain([1]);
@@ -1268,6 +1340,15 @@ describe('approveInternalTransfer', () => {
     expect(res.json).toHaveBeenCalledWith(
       expect.objectContaining({ status: 'COMPLETED' })
     );
+  });
+
+  test('returns 403 when the approver requested the transfer (maker-checker)', async () => {
+    db.mockReturnValueOnce(chain({ ...pendingTransfer, requested_by: 99 }));
+
+    const res = mockRes();
+    await approveInternalTransfer(mockReq({ transfer_id: 30, action: 'Approved' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(403);
   });
 
   test('reject: updates status to REJECTED', async () => {

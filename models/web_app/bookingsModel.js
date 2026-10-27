@@ -95,6 +95,19 @@ const applyBranchFilter = require('../../utils/applyBranchFilter');
 // //  console.log(login_data);
 //   return query;
 // }
+// Tenant org of the caller. No default org: a missing claim matches nothing.
+const orgOf = (login_data) => (login_data && login_data.is_owner !== true ? login_data.org_id ?? -1 : -1);
+
+// EXISTS clause for an open ticket on this booking whose category name matches
+// `pattern` (LIKE) inside the booking's own org.
+const openTicketExists = (pattern) => `EXISTS (
+  SELECT 1 FROM edx_support_requests t
+    JOIN edx_support_category c ON c.id = t.support_type_id AND c.org_id = edx_bookings.org_id
+   WHERE t.booking_details = edx_bookings.id
+     AND t.org_id = edx_bookings.org_id
+     AND t.status = 1
+     AND LOWER(c.name) LIKE '${pattern}')`;
+
 async function getUserBookingsModel(filters = {}, login_data) {
   const { user_id, id } = filters;
 
@@ -138,6 +151,9 @@ async function getUserBookingsModel(filters = {}, login_data) {
       'edx_patient.email as patient_email',
       'edx_patient.yob as patient_yob',
       'edx_patient.weight as patient_weight',
+      'edx_patient.languages as patient_languages',
+      'edx_patient.relation as patient_relation',
+      'edx_patient.is_stay_alone as patient_is_stay_alone',
 
       // care manager fields
       'edx_web_app_users.user_name as caremanager_name',
@@ -166,44 +182,28 @@ CASE
 END AS extension_status
 `),
 
-      // ✅ Only open status flags for hold (id=4) and cancel (id=6) tickets
-      db.raw(`
-        CASE WHEN hold_ticket.id IS NOT NULL THEN 1 ELSE 0 END AS hold_ticket_open
-      `),
-      db.raw(`
-        CASE WHEN cancel_ticket.id IS NOT NULL THEN 1 ELSE 0 END AS cancellation_ticket_open
-      `)
+      // Open (status 1) hold / cancellation tickets for this booking. The
+      // ticket category is resolved by NAME within the booking's org — category
+      // ids differ per tenant, so hard-coded ids (4 / 6) matched the wrong rows.
+      db.raw(`CASE WHEN ${openTicketExists('%hold%')} THEN 1 ELSE 0 END AS hold_ticket_open`),
+      db.raw(`CASE WHEN ${openTicketExists('%cancel%')} THEN 1 ELSE 0 END AS cancellation_ticket_open`)
     )
     .leftJoin('edx_client_app_users', 'edx_client_app_users.id', 'edx_bookings.user_id')
     .leftJoin('edx_user_address', 'edx_user_address.id', 'edx_bookings.address_id')
     .leftJoin('edx_patient', 'edx_patient.id', 'edx_bookings.patient_id')
     .leftJoin('edx_web_app_users', 'edx_web_app_users.id', 'edx_bookings.hp_manager')
     .leftJoin('edx_master_services', 'edx_master_services.id', 'edx_bookings.service_type_id')
-    .leftJoin('edx_branches', 'edx_branches.br_id', 'edx_bookings.branch_id')
-
-    // ✅ Hold ticket - support_type_id = 4, status = 1 (open)
-    .leftJoin('edx_support_requests as hold_ticket', function () {
-      this.on('hold_ticket.booking_details', '=', 'edx_bookings.id')
-          .andOnVal('hold_ticket.support_type_id', '=', 4)
-          .andOnVal('hold_ticket.status', '=', 1);
-    })
-
-    // ✅ Cancel ticket - support_type_id = 6, status = 1 (open)
-    .leftJoin('edx_support_requests as cancel_ticket', function () {
-      this.on('cancel_ticket.booking_details', '=', 'edx_bookings.id')
-          .andOnVal('cancel_ticket.support_type_id', '=', 6)
-          .andOnVal('cancel_ticket.status', '=', 1);
-    });
+    .leftJoin('edx_branches', 'edx_branches.br_id', 'edx_bookings.branch_id');
 
   query = applyBranchFilter(query, login_data, 'edx_bookings.branch_id');
-  query.where('edx_bookings.org_id', login_data?.org_id ?? 1);
+  query.where('edx_bookings.org_id', orgOf(login_data));
   if (user_id && user_id !== 'NULL') query.where('edx_bookings.user_id', user_id);
   if (id) query.where('edx_bookings.id', id);
 
   return query;
 }
 async function getHPByBookingModel(filters = {} , login_data) {
-  const { bkng_id, hp_unique_id } = filters;
+  const { bkng_id, hp_unique_id, status } = filters;
 
   let query = db('edx_booking_hp')
   .select(
@@ -217,21 +217,24 @@ async function getHPByBookingModel(filters = {} , login_data) {
     'edx_hp_registration.hp_reg_id'
   );
 
-  query.where('edx_booking_hp.org_id', login_data?.org_id ?? 1);
+  query.where('edx_booking_hp.org_id', orgOf(login_data));
   if (bkng_id && bkng_id !== 'NULL') query.where('edx_booking_hp.bkng_id', bkng_id);
-  if (hp_unique_id) query.where('edx_booking_hp.id', hp_unique_id);
-  console.log(query.toString());
+  if (hp_unique_id) query.where('edx_booking_hp.hp_unique_id', hp_unique_id);
+  if (status !== undefined && status !== '' && status !== 'NULL') {
+    const statuses = String(status).split(',').map((v) => v.trim()).filter(Boolean);
+    if (statuses.length) query.whereIn('edx_booking_hp.status', statuses);
+  }
   return query;
 }
 
 
 
 
-  async function getOTP (bkng_id, hp_unique_id) {
+  async function getOTP (bkng_id, hp_unique_id, org_id) {
 
       const result = await db('edx_booking_hp')
           .select('otp', 'bkng_id', 'hp_unique_id')
-          .where({ bkng_id, hp_unique_id })
+          .where({ bkng_id, hp_unique_id, org_id })   // org-scoped: no cross-org OTP read
           .whereIn('status', [3, 4])   // 3 = Finalized (OTP active), 4 = Active HP (OTP used)
           .first();
 

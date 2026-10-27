@@ -16,6 +16,7 @@ require('dotenv').config();
 const { getCurrentDateTime, toMysqlDate } = require('../../utils/dateTime');
 const { logAudit } = require('../../utils/auditLogger');
 const { withOrg, getOrgId } = require('../../utils/orgScope');
+const { guardOrgHandlers } = require('../../utils/requestOrg');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -444,7 +445,7 @@ const markHostelSettlementPaid = async (req, res) => {
   }
 };
 
-module.exports = {
+module.exports = guardOrgHandlers({
   getHostels,
   getHostelById,
   createHostel,
@@ -456,4 +457,4 @@ module.exports = {
   getHostelSettlement,
   createHostelSettlement,
   markHostelSettlementPaid,
-};
+});

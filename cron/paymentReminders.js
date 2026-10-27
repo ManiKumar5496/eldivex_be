@@ -18,6 +18,7 @@ const { sendEmail } = require('../utils/emailService');
 const { sendSMS   } = require('../utils/smsService');
 const { paymentReminder } = require('../utils/emailTemplates');
 const { getCurrentDateTime } = require('../utils/dateTime');
+const { notifyOrgAdmins } = require('../utils/notify');
 
 const REMINDER_DAYS = [0, 3, 7, 15]; // Days relative to due date to send reminders
 
@@ -28,16 +29,23 @@ async function runPaymentReminders() {
 
     // Fetch all unpaid / partially paid invoices with a due_date set
     const overdueInvoices = await db('edx_invoice as i')
-      .leftJoin('edx_bookings as b',        'i.booking_id', 'b.id')
-      .leftJoin('edx_web_app_users as u',   'b.user_id', 'u.id')
+      .join('edx_bookings as b', function () {
+        this.on('i.booking_id', '=', 'b.id').andOn('b.org_id', '=', 'i.org_id');
+      })
+      // bookings.user_id is a CLIENT id → edx_client_app_users (same org).
+      .leftJoin('edx_client_app_users as u', function () {
+        this.on('b.user_id', '=', 'u.id').andOn('u.org_id', '=', 'b.org_id');
+      })
       .leftJoin(
         db('edx_receipts')
-          .select('booking_id')
+          .select('booking_id', 'org_id')
           .sum('total_amount as total_paid')
           .where('status', 'Approved')
-          .groupBy('booking_id')
+          .groupBy('booking_id', 'org_id')
           .as('rec'),
-        'rec.booking_id', 'b.id'
+        function () {
+          this.on('rec.booking_id', '=', 'b.id').andOn('rec.org_id', '=', 'b.org_id');
+        }
       )
       .whereNotNull('i.due_date')
       .whereRaw('COALESCE(i.inv_raised_amnt,0) > COALESCE(rec.total_paid,0)')
@@ -51,7 +59,7 @@ async function runPaymentReminders() {
         db.raw('COALESCE(i.inv_raised_amnt,0) - COALESCE(rec.total_paid,0) as balance_due'),
         'u.user_name   as client_name',
         'u.user_email  as client_email',
-        'u.user_mobile as client_mobile',
+        'u.phone_number as client_mobile',
       );
 
     let sent = 0;
@@ -65,10 +73,11 @@ async function runPaymentReminders() {
       const reminderDay = REMINDER_DAYS.find(d => diffDays === d);
       if (reminderDay === undefined) continue; // Not a reminder day
 
-      // Check if already sent this reminder for this invoice
+      // Skip when this (invoice, reminder day) was already sent — reruns and
+      // restarts on the same day must not mail the client twice.
       const existing = await db('edx_payment_reminders')
         .where({ invoice_id: inv.invoice_id, reminder_day: reminderDay })
-        .first();
+        .first('id');
       if (existing) {
         skipped++;
         continue;
@@ -101,6 +110,17 @@ async function runPaymentReminders() {
           logger.warn(`[reminder] SMS failed for invoice #${inv.invoice_id}: ${smsErr.message}`);
         }
       }
+
+      // In-app notification for the org's admins (deduped per invoice+day)
+      await notifyOrgAdmins(inv.org_id, {
+        type:  'payment_due',
+        title: diffDays > 0
+          ? `Payment ${diffDays} days overdue — Invoice INV-${inv.invoice_id}`
+          : `Payment due today — Invoice INV-${inv.invoice_id}`,
+        body:  `${inv.client_name || 'Client'} owes ₹${Number(inv.balance_due).toLocaleString('en-IN')} on booking #${inv.booking_id} (due ${String(inv.due_date).split('T')[0]}).`,
+        data:  { invoice_id: inv.invoice_id, booking_id: inv.booking_id, route: 'accounts' },
+        dedupeKey: `pay:${inv.invoice_id}:${reminderDay}`,
+      });
 
       // Log the reminder to prevent duplicates
       await db('edx_payment_reminders').insert({

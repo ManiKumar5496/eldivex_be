@@ -15,7 +15,16 @@ const { getCurrentDateTime, toMysqlDate } = require('../../utils/dateTime');
 const { withOrg, orgQuery, getOrgId } = require('../../utils/orgScope');
 const withTransaction = require('../../utils/withTransaction');
 const { sendEmail } = require('../../utils/emailService');
-const { paymentReminder, creditNoteGenerated } = require('../../utils/emailTemplates');
+const { paymentReminder, creditNoteGenerated, paymentReceiptEmail } = require('../../utils/emailTemplates');
+const { getOrgBrand } = require('../../utils/orgBrand');
+const { notifyOrgAdmins } = require('../../utils/notify');
+const { getClientContact } = require('../../utils/clientContact');
+const { guardOrgHandlers } = require('../../utils/requestOrg');
+const crypto = require('crypto');
+
+// Every accounts error carries the same text under both `error` and `message`
+// (front ends read either). Field names of requests are unchanged.
+const errBody = (text, extra = {}) => ({ ...extra, error: text, message: text });
 
 // ── 1. Get Active Clients ─────────────────────────────────────────────────────
 
@@ -91,7 +100,7 @@ const getActiveClients = async (req, res) => {
     res.json(data);
   } catch (err) {
     logger.error(`Error getActiveClients: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while fetching active clients.' });
+    res.status(500).json(errBody('An error occurred while fetching active clients.'));
   }
 };
 
@@ -118,11 +127,11 @@ const createProvisionalReceipt = async (req, res) => {
     } = req.body;
 
     if (!booking_id || !amount) {
-      return res.status(400).json({ message: 'booking_id and amount are required.' });
+      return res.status(400).json(errBody('booking_id and amount are required.'));
     }
 
     if (Number(amount) <= 0) {
-      return res.status(400).json({ message: 'Amount must be greater than zero.' });
+      return res.status(400).json(errBody('Amount must be greater than zero.'));
     }
 
     const orgId = getOrgId(req);
@@ -130,10 +139,10 @@ const createProvisionalReceipt = async (req, res) => {
     // Guard: booking must not be cancelled (status 6)
     const booking = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first();
     if (!booking) {
-      return res.status(404).json({ message: 'Booking not found.' });
+      return res.status(404).json(errBody('Booking not found.'));
     }
     if (String(booking.status) === '6') {
-      return res.status(400).json({ message: 'Cannot create receipt for a cancelled booking.' });
+      return res.status(400).json(errBody('Cannot create receipt for a cancelled booking.'));
     }
 
     // Guard: period must not be closed
@@ -145,9 +154,9 @@ const createProvisionalReceipt = async (req, res) => {
         .where({ org_id: orgId, period_month: periodMonth, period_year: periodYear, status: 'Closed' })
         .first();
       if (closedPeriod) {
-        return res.status(400).json({
-          message: `Period ${periodMonth}/${periodYear} is closed. No new entries allowed.`,
-        });
+        return res.status(400).json(errBody(
+          `Period ${periodMonth}/${periodYear} is closed. No new entries allowed.`,
+        ));
       }
     }
 
@@ -176,11 +185,52 @@ const createProvisionalReceipt = async (req, res) => {
       created_on:     getCurrentDateTime(),
     }));
 
-    const receipt = await db('edx_receipts').where({ id }).first();
+    const receipt = await db('edx_receipts').where({ id, org_id: getOrgId(req) }).first();
     res.status(201).json({ message: 'Payment recorded successfully.', id, data: receipt });
+
+    notifyOrgAdmins(getOrgId(req), {
+      type:  'receipt',
+      title: `Payment received — ₹${Number(total_amount).toLocaleString('en-IN')}`,
+      body:  `Receipt ${receipt_number} recorded for booking #${booking_id} (${payment_mode || 'Cash'}).`,
+      data:  { receipt_id: id, booking_id, route: 'accounts' },
+    });
+
+    // ── Send payment receipt email to client (fire-and-forget) ──────────────
+    setImmediate(async () => {
+      try {
+        const [user, org, meta] = await Promise.all([
+          getClientContact(booking.user_id, orgId), // client id → edx_client_app_users
+          getOrgBrand(db, orgId),
+          db('edx_bookings as b')
+            .where({ 'b.id': booking_id, 'b.org_id': orgId })
+            .leftJoin('edx_patient as p', 'b.patient_id', 'p.id')
+            .first('p.patient_name'),
+        ]);
+        if (user && user.user_email) {
+          const tpl = paymentReceiptEmail({
+            org,
+            clientName:    user.user_name || 'Client',
+            receiptNumber: receipt_number,
+            receiptDate:   receipt?.receipt_date || getCurrentDateTime(),
+            bookingId:     booking_id,
+            patientName:   meta?.patient_name,
+            amount:        Number(amount),
+            taxAmount:     Number(tax_amount),
+            totalAmount:   total_amount,
+            paymentMode:   payment_mode,
+            transactionId: transaction_id,
+            periodFrom:    period_from,
+            periodTo:      period_to,
+          });
+          await sendEmail({ to: user.user_email, fromName: org?.name, ...tpl });
+        }
+      } catch (emailErr) {
+        logger.warn(`[email] Payment receipt email failed for receipt ${receipt_number}: ${emailErr.message}`);
+      }
+    });
   } catch (err) {
     logger.error(`Error createProvisionalReceipt: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while recording payment.' });
+    res.status(500).json(errBody('An error occurred while recording payment.'));
   }
 };
 
@@ -195,11 +245,11 @@ const updateReceiptStatus = async (req, res) => {
     const { id, status } = req.body;
 
     if (!id || !status) {
-      return res.status(400).json({ message: 'id and status are required.' });
+      return res.status(400).json(errBody('id and status are required.'));
     }
 
     if (!['Approved', 'Cancelled'].includes(status)) {
-      return res.status(400).json({ message: 'status must be Approved or Cancelled.' });
+      return res.status(400).json(errBody('status must be Approved or Cancelled.'));
     }
 
     // Guard: only Pending receipts can be updated
@@ -208,12 +258,12 @@ const updateReceiptStatus = async (req, res) => {
       .andWhere('org_id', getOrgId(req))
       .first();
     if (!receipt) {
-      return res.status(404).json({ message: 'Receipt not found.' });
+      return res.status(404).json(errBody('Receipt not found.'));
     }
     if (receipt.status !== 'Pending') {
-      return res.status(400).json({
-        message: `Receipt is already ${receipt.status}. No changes allowed.`,
-      });
+      return res.status(400).json(errBody(
+        `Receipt is already ${receipt.status}. No changes allowed.`,
+      ));
     }
 
     const updated = await db('edx_receipts')
@@ -226,13 +276,13 @@ const updateReceiptStatus = async (req, res) => {
       });
 
     if (!updated) {
-      return res.status(404).json({ message: 'Receipt not found.' });
+      return res.status(404).json(errBody('Receipt not found.'));
     }
 
     res.json({ message: `Receipt ${status.toLowerCase()} successfully.` });
   } catch (err) {
     logger.error(`Error updateReceiptStatus: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while updating receipt status.' });
+    res.status(500).json(errBody('An error occurred while updating receipt status.'));
   }
 };
 
@@ -248,7 +298,7 @@ const getClientStatements = async (req, res) => {
     const { booking_id, user_id } = req.query;
 
     if (!booking_id && !user_id) {
-      return res.status(400).json({ message: 'booking_id or user_id is required.' });
+      return res.status(400).json(errBody('booking_id or user_id is required.'));
     }
 
     // Build invoice rows
@@ -306,7 +356,7 @@ const getClientStatements = async (req, res) => {
     res.json(result);
   } catch (err) {
     logger.error(`Error getClientStatements: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while fetching client statements.' });
+    res.status(500).json(errBody('An error occurred while fetching client statements.'));
   }
 };
 
@@ -329,37 +379,45 @@ const createWriteOff = async (req, res) => {
     } = req.body;
 
     if (!write_off_amount) {
-      return res.status(400).json({ message: 'write_off_amount is required.' });
+      return res.status(400).json(errBody('write_off_amount is required.'));
     }
 
     if (Number(write_off_amount) <= 0) {
-      return res.status(400).json({ message: 'write_off_amount must be greater than zero.' });
+      return res.status(400).json(errBody('write_off_amount must be greater than zero.'));
     }
 
     const orgId = getOrgId(req);
 
     if (booking_id) {
+      // The booking must belong to the caller's org — otherwise this would
+      // reveal (and write off against) another tenant's balance.
+      const ownBooking = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first('id', 'user_id');
+      if (!ownBooking) return res.status(404).json(errBody('Booking not found.'));
+      if (user_id && ownBooking.user_id != null && String(ownBooking.user_id) !== String(user_id)) {
+        return res.status(400).json(errBody('user_id does not match the booking client.'));
+      }
+
       // Guard: no pending write-off already exists for this booking
       const existingPending = await db('edx_write_offs')
         .where({ booking_id, status: 'Pending', org_id: orgId })
         .first();
       if (existingPending) {
-        return res.status(400).json({
-          message: 'A pending write-off already exists for this booking. Approve or reject it first.',
-        });
+        return res.status(400).json(errBody(
+          'A pending write-off already exists for this booking. Approve or reject it first.',
+        ));
       }
 
       // Guard: write-off cannot exceed outstanding balance
       const totalBilledRow = await db('edx_invoice')
-        .where({ booking_id }).sum('inv_raised_amnt as total_billed').first();
+        .where({ booking_id, org_id: orgId }).sum('inv_raised_amnt as total_billed').first();
       const totalPaidRow = await db('edx_receipts')
-        .where({ booking_id, status: 'Approved' }).sum('total_amount as total_paid').first();
+        .where({ booking_id, org_id: orgId, status: 'Approved' }).sum('total_amount as total_paid').first();
       const outstanding = (Number(totalBilledRow.total_billed) || 0) - (Number(totalPaidRow.total_paid) || 0);
       if (Number(write_off_amount) > outstanding) {
-        return res.status(400).json({
-          message: `Write-off amount (₹${Number(write_off_amount).toFixed(2)}) exceeds outstanding balance (₹${outstanding.toFixed(2)}).`,
-          outstanding,
-        });
+        return res.status(400).json(errBody(
+          `Write-off amount (₹${Number(write_off_amount).toFixed(2)}) exceeds outstanding balance (₹${outstanding.toFixed(2)}).`,
+          { outstanding },
+        ));
       }
     }
 
@@ -376,11 +434,11 @@ const createWriteOff = async (req, res) => {
       created_on:      getCurrentDateTime(),
     }));
 
-    const writeOff = await db('edx_write_offs').where({ id }).first();
+    const writeOff = await db('edx_write_offs').where({ id, org_id: getOrgId(req) }).first();
     res.status(201).json({ message: 'Write-off created successfully.', data: writeOff });
   } catch (err) {
     logger.error(`Error createWriteOff: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while creating write-off.' });
+    res.status(500).json(errBody('An error occurred while creating write-off.'));
   }
 };
 
@@ -395,11 +453,11 @@ const updateWriteOffStatus = async (req, res) => {
     const { id, status } = req.body;
 
     if (!id || !status) {
-      return res.status(400).json({ message: 'id and status are required.' });
+      return res.status(400).json(errBody('id and status are required.'));
     }
 
     if (!['Approved', 'Rejected'].includes(status)) {
-      return res.status(400).json({ message: 'status must be Approved or Rejected.' });
+      return res.status(400).json(errBody('status must be Approved or Rejected.'));
     }
 
     // Guard: only Pending write-offs can be updated
@@ -408,16 +466,19 @@ const updateWriteOffStatus = async (req, res) => {
       .andWhere('org_id', getOrgId(req))
       .first();
     if (!writeOff) {
-      return res.status(404).json({ message: 'Write-off not found.' });
+      return res.status(404).json(errBody('Write-off not found.'));
     }
     if (writeOff.status !== 'Pending') {
-      return res.status(400).json({
-        message: `Write-off is already ${writeOff.status}. No changes allowed.`,
-      });
+      return res.status(400).json(errBody(
+        `Write-off is already ${writeOff.status}. No changes allowed.`,
+      ));
+    }
+    if (status === 'Approved' && _isOwnRequest(writeOff, req.login_data.id)) {
+      return res.status(403).json(errBody('You cannot approve a write-off you created.'));
     }
 
     const updated = await db('edx_write_offs')
-      .where({ id })
+      .where({ id, status: 'Pending' })
       .andWhere('org_id', getOrgId(req))
       .update({
         status,
@@ -426,13 +487,13 @@ const updateWriteOffStatus = async (req, res) => {
       });
 
     if (!updated) {
-      return res.status(404).json({ message: 'Write-off not found.' });
+      return res.status(404).json(errBody('Write-off not found.'));
     }
 
     res.json({ message: `Write-off ${status.toLowerCase()} successfully.` });
   } catch (err) {
     logger.error(`Error updateWriteOffStatus: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while updating write-off status.' });
+    res.status(500).json(errBody('An error occurred while updating write-off status.'));
   }
 };
 
@@ -523,7 +584,7 @@ const getInvoices = async (req, res) => {
     res.json(finalResults.slice(offset, offset + limit));
   } catch (err) {
     logger.error(`Error getInvoices: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while fetching invoices.' });
+    res.status(500).json(errBody('An error occurred while fetching invoices.'));
   }
 };
 
@@ -538,7 +599,16 @@ const createCreditNote = async (req, res) => {
     const { booking_id, invoice_id, credit_type, amount, reason, credit_date } = req.body;
 
     if (!booking_id || !amount) {
-      return res.status(400).json({ message: 'booking_id and amount are required.' });
+      return res.status(400).json(errBody('booking_id and amount are required.'));
+    }
+    if (!(Number(amount) > 0)) return res.status(400).json(errBody('amount must be greater than zero.'));
+
+    const orgId = getOrgId(req);
+    const cnBooking = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first('id', 'user_id');
+    if (!cnBooking) return res.status(404).json(errBody('Booking not found.'));
+    if (invoice_id) {
+      const cnInvoice = await db('edx_invoice').where({ id: invoice_id, org_id: orgId, booking_id }).first('id');
+      if (!cnInvoice) return res.status(404).json(errBody('Invoice not found for this booking.'));
     }
 
     const [id] = await db('edx_credit_notes').insert(withOrg(req, {
@@ -553,18 +623,21 @@ const createCreditNote = async (req, res) => {
       created_on:  getCurrentDateTime(),
     }));
 
-    const note = await db('edx_credit_notes').where({ id }).first();
+    const note = await db('edx_credit_notes').where({ id, org_id: getOrgId(req) }).first();
     res.status(201).json({ message: 'Credit note created.', data: note });
+
+    notifyOrgAdmins(getOrgId(req), {
+      type:  'credit_note',
+      title: `Credit note issued — ₹${Number(amount).toLocaleString('en-IN')}`,
+      body:  `${credit_type || 'Hold'} credit note #${id} created for booking #${booking_id}${reason ? ` — ${reason}` : ''}.`,
+      data:  { credit_note_id: id, booking_id, route: 'accounts' },
+    });
 
     // Notify accounts team via email (fire-and-forget)
     setImmediate(async () => {
       try {
-        const booking = await db('edx_bookings as b')
-          .leftJoin('edx_client_app_users as u', 'b.user_id', 'u.id')
-          .where('b.id', booking_id)
-          .select('u.user_email', 'u.user_name')
-          .first();
-        if (booking && booking.user_email && booking.user_email !== 'NA') {
+        const booking = await getClientContact(cnBooking.user_id, orgId);
+        if (booking && booking.user_email) {
           const tpl = creditNoteGenerated({
             clientName:  booking.user_name || 'Client',
             creditType:  credit_type || 'Hold',
@@ -581,7 +654,7 @@ const createCreditNote = async (req, res) => {
     });
   } catch (err) {
     logger.error(`Error createCreditNote: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while creating credit note.' });
+    res.status(500).json(errBody('An error occurred while creating credit note.'));
   }
 };
 
@@ -612,7 +685,7 @@ const getCreditNotes = async (req, res) => {
     res.json(data);
   } catch (err) {
     logger.error(`Error getCreditNotes: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while fetching credit notes.' });
+    res.status(500).json(errBody('An error occurred while fetching credit notes.'));
   }
 };
 
@@ -625,9 +698,9 @@ const getCreditNotes = async (req, res) => {
 const updateCreditNoteStatus = async (req, res) => {
   try {
     const { id, status } = req.body;
-    if (!id || !status) return res.status(400).json({ message: 'id and status required.' });
+    if (!id || !status) return res.status(400).json(errBody('id and status required.'));
     if (!['Approved', 'Rejected'].includes(status)) {
-      return res.status(400).json({ message: 'status must be Approved or Rejected.' });
+      return res.status(400).json(errBody('status must be Approved or Rejected.'));
     }
 
     // Guard: only Pending credit notes can be updated
@@ -635,22 +708,22 @@ const updateCreditNoteStatus = async (req, res) => {
       .where({ id })
       .andWhere('org_id', getOrgId(req))
       .first();
-    if (!creditNote) return res.status(404).json({ message: 'Credit note not found.' });
+    if (!creditNote) return res.status(404).json(errBody('Credit note not found.'));
     if (creditNote.status !== 'Pending') {
-      return res.status(400).json({
-        message: `Credit note is already ${creditNote.status}. No changes allowed.`,
-      });
+      return res.status(400).json(errBody(
+        `Credit note is already ${creditNote.status}. No changes allowed.`,
+      ));
     }
 
     const updated = await db('edx_credit_notes')
       .where({ id })
       .andWhere('org_id', getOrgId(req))
       .update({ status, updated_by: req.login_data.id, updated_on: getCurrentDateTime() });
-    if (!updated) return res.status(404).json({ message: 'Credit note not found.' });
+    if (!updated) return res.status(404).json(errBody('Credit note not found.'));
     res.json({ message: `Credit note ${status.toLowerCase()}.` });
   } catch (err) {
     logger.error(`Error updateCreditNoteStatus: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred.' });
+    res.status(500).json(errBody('An error occurred.'));
   }
 };
 
@@ -732,7 +805,7 @@ const getAgingReport = async (req, res) => {
     res.json({ buckets, total_outstanding: invoices.reduce((s, i) => s + Number(i.balance_due), 0) });
   } catch (err) {
     logger.error(`Error getAgingReport: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while fetching aging report.' });
+    res.status(500).json(errBody('An error occurred while fetching aging report.'));
   }
 };
 
@@ -807,7 +880,7 @@ const getCollectionsKPIs = async (req, res) => {
     });
   } catch (err) {
     logger.error(`Error getCollectionsKPIs: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while fetching KPIs.' });
+    res.status(500).json(errBody('An error occurred while fetching KPIs.'));
   }
 };
 
@@ -833,9 +906,9 @@ const bulkGenerateInvoices = async (req, res) => {
       .where({ org_id: orgId, period_month: month, period_year: year, status: 'Closed' })
       .first();
     if (closedPeriod) {
-      return res.status(400).json({
-        message: `Period ${month}/${year} is closed. Invoices cannot be generated for a closed period.`,
-      });
+      return res.status(400).json(errBody(
+        `Period ${month}/${year} is closed. Invoices cannot be generated for a closed period.`,
+      ));
     }
 
     // Month start/end strings
@@ -902,7 +975,7 @@ const bulkGenerateInvoices = async (req, res) => {
     res.json({ message: `${generated} invoice(s) generated for ${monthStr}/${year}.`, generated });
   } catch (err) {
     logger.error(`Error bulkGenerateInvoices: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred during bulk invoice generation.' });
+    res.status(500).json(errBody('An error occurred during bulk invoice generation.'));
   }
 };
 
@@ -916,7 +989,7 @@ const bulkGenerateInvoices = async (req, res) => {
 const closePeriod = async (req, res) => {
   try {
     const { month, year } = req.body;
-    if (!month || !year) return res.status(400).json({ message: 'month and year are required.' });
+    if (!month || !year) return res.status(400).json(errBody('month and year are required.'));
     const orgId = getOrgId(req);
 
     const existing = await db('edx_period_closing')
@@ -924,7 +997,7 @@ const closePeriod = async (req, res) => {
       .first();
 
     if (existing) {
-      return res.status(409).json({ message: `Period ${month}/${year} is already closed.` });
+      return res.status(409).json(errBody(`Period ${month}/${year} is already closed.`));
     }
 
     await db('edx_period_closing').insert({
@@ -939,7 +1012,7 @@ const closePeriod = async (req, res) => {
     res.json({ message: `Period ${month}/${year} closed successfully.` });
   } catch (err) {
     logger.error(`Error closePeriod: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while closing period.' });
+    res.status(500).json(errBody('An error occurred while closing period.'));
   }
 };
 
@@ -954,7 +1027,7 @@ const getClosedPeriods = async (req, res) => {
     res.json(data);
   } catch (err) {
     logger.error(`Error getClosedPeriods: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred.' });
+    res.status(500).json(errBody('An error occurred.'));
   }
 };
 
@@ -1038,7 +1111,7 @@ const getRevenueRecognition = async (req, res) => {
     });
   } catch (err) {
     logger.error(`Error getRevenueRecognition: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while fetching revenue recognition data.' });
+    res.status(500).json(errBody('An error occurred while fetching revenue recognition data.'));
   }
 };
 
@@ -1050,7 +1123,7 @@ const getRevenueRecognition = async (req, res) => {
 const createInsuranceClaim = async (req, res) => {
   try {
     const { booking_id, user_id, tpa_name, policy_number, pre_auth_number, claim_amount, remarks } = req.body;
-    if (!booking_id) return res.status(400).json({ message: 'booking_id is required.' });
+    if (!booking_id) return res.status(400).json(errBody('booking_id is required.'));
 
     const [id] = await db('edx_insurance_claims').insert(withOrg(req, {
       booking_id,
@@ -1065,11 +1138,11 @@ const createInsuranceClaim = async (req, res) => {
       created_on:     getCurrentDateTime(),
     }));
 
-    const claim = await db('edx_insurance_claims').where({ id }).first();
+    const claim = await db('edx_insurance_claims').where({ id, org_id: getOrgId(req) }).first();
     res.status(201).json({ message: 'Insurance claim created.', data: claim });
   } catch (err) {
     logger.error(`Error createInsuranceClaim: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred.' });
+    res.status(500).json(errBody('An error occurred.'));
   }
 };
 
@@ -1080,11 +1153,11 @@ const createInsuranceClaim = async (req, res) => {
 const updateInsuranceClaim = async (req, res) => {
   try {
     const { id, status, settled_amount, remarks, settled_date } = req.body;
-    if (!id || !status) return res.status(400).json({ message: 'id and status required.' });
+    if (!id || !status) return res.status(400).json(errBody('id and status required.'));
 
     const validStatuses = ['Pending', 'Submitted', 'Approved', 'Rejected', 'Settled'];
     if (!validStatuses.includes(status)) {
-      return res.status(400).json({ message: `status must be one of: ${validStatuses.join(', ')}` });
+      return res.status(400).json(errBody(`status must be one of: ${validStatuses.join(', ')}`));
     }
 
     const updateData = {
@@ -1101,11 +1174,11 @@ const updateInsuranceClaim = async (req, res) => {
       .andWhere('org_id', getOrgId(req))
       .update(updateData);
 
-    if (!updated) return res.status(404).json({ message: 'Claim not found.' });
+    if (!updated) return res.status(404).json(errBody('Claim not found.'));
     res.json({ message: `Claim updated to ${status}.` });
   } catch (err) {
     logger.error(`Error updateInsuranceClaim: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred.' });
+    res.status(500).json(errBody('An error occurred.'));
   }
 };
 
@@ -1134,7 +1207,7 @@ const getInsuranceClaims = async (req, res) => {
     res.json(data);
   } catch (err) {
     logger.error(`Error getInsuranceClaims: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred.' });
+    res.status(500).json(errBody('An error occurred.'));
   }
 };
 
@@ -1148,7 +1221,7 @@ const getInsuranceClaims = async (req, res) => {
 const getCancellationBilling = async (req, res) => {
   try {
     const { booking_id, cancel_date } = req.query;
-    if (!booking_id) return res.status(400).json({ message: 'booking_id is required.' });
+    if (!booking_id) return res.status(400).json(errBody('booking_id is required.'));
 
     const booking = await db('edx_bookings as b')
       .leftJoin('edx_client_app_users as u', 'b.user_id', 'u.id')
@@ -1165,7 +1238,7 @@ const getCancellationBilling = async (req, res) => {
       )
       .first();
 
-    if (!booking) return res.status(404).json({ message: 'Booking not found.' });
+    if (!booking) return res.status(404).json(errBody('Booking not found.'));
 
     const cancelDate = cancel_date || new Date().toISOString().split('T')[0];
     const startDate  = booking.service_start_date;
@@ -1179,7 +1252,7 @@ const getCancellationBilling = async (req, res) => {
 
     // Total paid so far
     const paidRow = await db('edx_receipts')
-      .where({ booking_id, status: 'Approved' })
+      .where({ booking_id, org_id: getOrgId(req), status: 'Approved' })
       .sum('total_amount as total_paid')
       .first();
     const totalPaid = Number(paidRow.total_paid) || 0;
@@ -1206,7 +1279,7 @@ const getCancellationBilling = async (req, res) => {
     });
   } catch (err) {
     logger.error(`Error getCancellationBilling: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred.' });
+    res.status(500).json(errBody('An error occurred.'));
   }
 };
 
@@ -1222,10 +1295,24 @@ const createPaymentLink = async (req, res) => {
   try {
     const { invoice_id, amount } = req.body;
     if (!invoice_id || !amount) {
-      return res.status(400).json({ message: 'invoice_id and amount are required.' });
+      return res.status(400).json(errBody('invoice_id and amount are required.'));
     }
     const orgId  = getOrgId(req);
     const userId = req.login_data.id;
+
+    // Ownership check: the invoice must belong to the caller's org. Prevents a
+    // cross-org IDOR that would leak another tenant's client PII and let a
+    // payment link be raised against their invoice.
+    const inv = await db('edx_invoice as i')
+      .leftJoin('edx_bookings as b', 'i.booking_id', 'b.id')
+      .leftJoin('edx_client_app_users as u', 'b.user_id', 'u.id')
+      .where('i.id', invoice_id)
+      .andWhere('i.org_id', orgId)
+      .select('u.user_name', 'u.phone_number as user_mobile', 'u.user_email', 'i.booking_id')
+      .first();
+    if (!inv) {
+      return res.status(404).json(errBody('Invoice not found.'));
+    }
 
     // Check if Razorpay is configured
     const RAZORPAY_KEY_ID     = process.env.RAZORPAY_KEY_ID;
@@ -1240,14 +1327,6 @@ const createPaymentLink = async (req, res) => {
         const Razorpay = require('razorpay');
         const rzp = new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
 
-        // Fetch invoice details for description
-        const inv = await db('edx_invoice as i')
-          .leftJoin('edx_bookings as b', 'i.booking_id', 'b.id')
-          .leftJoin('edx_client_app_users as u', 'b.user_id', 'u.id')
-          .where('i.id', invoice_id)
-          .select('u.user_name', 'u.phone_number as user_mobile', 'u.user_email', 'i.booking_id')
-          .first();
-
         const payLink = await rzp.paymentLink.create({
           amount:      Math.round(Number(amount) * 100), // paise
           currency:    'INR',
@@ -1257,6 +1336,8 @@ const createPaymentLink = async (req, res) => {
             email: inv?.user_email || undefined,
             contact: inv?.user_mobile || undefined,
           },
+          // The webhook resolves the invoice (and its org) from these notes.
+          notes: { invoice_id: String(invoice_id), org_id: String(orgId) },
           notify: { sms: true, email: true },
           reminder_enable: true,
           callback_url: `${process.env.APP_BASE_URL || ''}/payment-success`,
@@ -1292,77 +1373,141 @@ const createPaymentLink = async (req, res) => {
     });
   } catch (err) {
     logger.error(`Error createPaymentLink: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred.' });
+    res.status(500).json(errBody('An error occurred.'));
   }
 };
 
 /**
- * POST /api/razorpay/webhook
- * Receives Razorpay payment.captured event → auto-creates Approved receipt.
+ * POST /api/razorpay/webhook  (public — authenticated by the Razorpay signature)
+ * Receives payment.captured / payment_link.paid → auto-creates an Approved
+ * receipt in the invoice's org. Deduplicated via edx_payment_webhook_events.
  */
 const razorpayWebhook = async (req, res) => {
   try {
-    // Verify webhook signature
+    // Signature is mandatory: without a configured secret every payload would
+    // be forgeable, so the endpoint refuses to run at all.
     const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET;
-    if (RAZORPAY_WEBHOOK_SECRET) {
-      const crypto = require('crypto');
-      const signature = req.headers['x-razorpay-signature'];
-      const body      = JSON.stringify(req.body);
-      const expected  = crypto.createHmac('sha256', RAZORPAY_WEBHOOK_SECRET).update(body).digest('hex');
-      if (signature !== expected) {
-        return res.status(400).json({ message: 'Invalid webhook signature.' });
-      }
+    if (!RAZORPAY_WEBHOOK_SECRET) {
+      logger.error('[webhook] RAZORPAY_WEBHOOK_SECRET is not set — rejecting webhook.');
+      return res.status(503).json(errBody('Payment webhook is not configured.'));
     }
 
-    const event = req.body;
-    if (event.event !== 'payment.captured') {
+    // HMAC over the exact raw bytes Razorpay signed (req.rawBody, kept by the
+    // JSON parser) — re-serialising req.body would not match byte for byte.
+    const signature = String(req.headers['x-razorpay-signature'] || '');
+    const raw = req.rawBody;
+    if (!signature || !raw || !raw.length) {
+      return res.status(400).json(errBody('Invalid webhook signature.'));
+    }
+    const expected = crypto.createHmac('sha256', RAZORPAY_WEBHOOK_SECRET).update(raw).digest('hex');
+    const a = Buffer.from(signature, 'utf8');
+    const b = Buffer.from(expected, 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(400).json(errBody('Invalid webhook signature.'));
+    }
+
+    const event = req.body || {};
+    if (event.event !== 'payment.captured' && event.event !== 'payment_link.paid') {
       return res.status(200).json({ message: 'Event ignored.' });
     }
 
     const payment = event.payload?.payment?.entity;
-    if (!payment) return res.status(400).json({ message: 'No payment entity.' });
+    if (!payment || !payment.id) return res.status(400).json(errBody('No payment entity.'));
 
-    const amountPaise = payment.amount;
-    const amountINR   = amountPaise / 100;
-    const paymentId   = payment.id;
-    const notes       = payment.notes || {};
-    const invoiceId   = notes.invoice_id || null;
+    const paymentId = String(payment.id);
+    const amountINR = (Number(payment.amount) || 0) / 100;
+    const notes     = payment.notes || event.payload?.payment_link?.entity?.notes || {};
+    let invoiceId   = parseInt(notes.invoice_id, 10) || null;
 
+    // Links created before notes were set: resolve via the stored link id.
+    const linkId = event.payload?.payment_link?.entity?.id || payment.payment_link_id;
+    if (!invoiceId && linkId) {
+      const link = await db('edx_payment_links').where({ razorpay_link_id: linkId }).first('invoice_id');
+      invoiceId = link?.invoice_id || null;
+    }
     if (!invoiceId) {
-      logger.warn(`[webhook] Payment ${paymentId} has no invoice_id in notes.`);
+      logger.warn(`[webhook] Payment ${paymentId} carries no invoice reference.`);
       return res.status(200).json({ message: 'No invoice_id in notes.' });
     }
 
-    // Fetch invoice → booking_id
-    const inv = await db('edx_invoice').where({ id: invoiceId }).first();
-    if (!inv) return res.status(200).json({ message: 'Invoice not found.' });
+    const result = await withTransaction(async (trx) => {
+      // Idempotency: one row per payment. A retry / replay hits the unique key.
+      let eventRowId;
+      try {
+        [eventRowId] = await trx('edx_payment_webhook_events').insert({
+          provider:    'razorpay',
+          event_id:    req.headers['x-razorpay-event-id'] || null,
+          event_type:  event.event,
+          payment_id:  paymentId,
+          invoice_id:  invoiceId,
+          amount:      amountINR,
+          status:      'received',
+          received_on: getCurrentDateTime(),
+        });
+      } catch (dupErr) {
+        if (dupErr.code === 'ER_DUP_ENTRY') return { duplicate: true };
+        throw dupErr;
+      }
 
-    // Auto-create Approved receipt
-    await db('edx_receipts').insert({
-      booking_id:     inv.booking_id,
-      amount:         amountINR,
-      tax_amount:     0,
-      total_amount:   amountINR,
-      payment_mode:   'Online',
-      transaction_id: paymentId,
-      receipt_date:   new Date().toISOString().split('T')[0],
-      status:         'Approved',
-      receipt_type:   'Payment',
-      org_id:         inv.org_id,
-      created_on:     getCurrentDateTime(),
+      // The invoice row decides the org — never the payload.
+      const inv = await trx('edx_invoice').where({ id: invoiceId }).forUpdate().first();
+      if (!inv) {
+        await trx('edx_payment_webhook_events').where({ id: eventRowId }).update({ status: 'ignored' });
+        return { ignored: 'Invoice not found.' };
+      }
+      if (notes.org_id && String(notes.org_id) !== String(inv.org_id)) {
+        logger.warn(`[webhook] Payment ${paymentId}: notes.org_id ${notes.org_id} ≠ invoice org ${inv.org_id}.`);
+        await trx('edx_payment_webhook_events').where({ id: eventRowId }).update({ status: 'ignored', org_id: inv.org_id });
+        return { ignored: 'Organisation mismatch.' };
+      }
+
+      const orgId   = inv.org_id;
+      const booking = await trx('edx_bookings').where({ id: inv.booking_id, org_id: orgId }).first('user_id');
+      const countRow = await trx('edx_receipts').where({ org_id: orgId }).count('id as cnt').first();
+      const receipt_number = `RCP-${orgId}-${String((Number(countRow?.cnt) || 0) + 1).padStart(6, '0')}`;
+
+      const [receiptId] = await trx('edx_receipts').insert({
+        receipt_number,
+        booking_id:     inv.booking_id,
+        invoice_id:     inv.id,
+        user_id:        booking?.user_id ?? null,
+        amount:         amountINR,
+        tax_amount:     0,
+        total_amount:   amountINR,
+        payment_mode:   'Online',
+        transaction_id: paymentId,
+        receipt_date:   new Date().toISOString().split('T')[0],
+        status:         'Approved',
+        receipt_type:   'Payment',
+        org_id:         orgId,
+        created_on:     getCurrentDateTime(),
+      });
+
+      await trx('edx_payment_links')
+        .where({ invoice_id: inv.id, org_id: orgId })
+        .where('status', 'Created')
+        .update({ status: 'Paid', paid_at: getCurrentDateTime() });
+
+      await trx('edx_payment_webhook_events').where({ id: eventRowId })
+        .update({ status: 'processed', org_id: orgId, receipt_id: receiptId });
+
+      return { receiptId, orgId, bookingId: inv.booking_id };
     });
 
-    // Mark payment link as Paid
-    await db('edx_payment_links')
-      .where({ invoice_id: invoiceId })
-      .where('status', 'Created')
-      .update({ status: 'Paid', paid_at: getCurrentDateTime() });
+    if (result.duplicate) return res.status(200).json({ message: 'Already processed.' });
+    if (result.ignored) return res.status(200).json({ message: result.ignored });
 
-    logger.info(`[webhook] Auto-receipt created for invoice #${invoiceId}, amount ₹${amountINR}`);
+    logger.info(`[webhook] Auto-receipt #${result.receiptId} for invoice #${invoiceId}, ₹${amountINR} (org ${result.orgId})`);
+    notifyOrgAdmins(result.orgId, {
+      type:  'receipt',
+      title: `Online payment received — ₹${Number(amountINR).toLocaleString('en-IN')}`,
+      body:  `Razorpay payment ${paymentId} recorded against invoice INV-${invoiceId}.`,
+      data:  { receipt_id: result.receiptId, booking_id: result.bookingId, route: 'accounts' },
+    });
     res.status(200).json({ message: 'Receipt auto-created.' });
   } catch (err) {
     logger.error(`Error razorpayWebhook: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred.' });
+    res.status(500).json(errBody('An error occurred.'));
   }
 };
 
@@ -1374,7 +1519,7 @@ const razorpayWebhook = async (req, res) => {
 const getRateHistory = async (req, res) => {
   try {
     const { booking_id } = req.query;
-    if (!booking_id) return res.status(400).json({ message: 'booking_id is required.' });
+    if (!booking_id) return res.status(400).json(errBody('booking_id is required.'));
 
     const data = await db('edx_rate_history as rh')
       .leftJoin('edx_web_app_users as u', 'rh.changed_by', 'u.id')
@@ -1386,7 +1531,7 @@ const getRateHistory = async (req, res) => {
     res.json(data);
   } catch (err) {
     logger.error(`Error getRateHistory: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred.' });
+    res.status(500).json(errBody('An error occurred.'));
   }
 };
 
@@ -1424,7 +1569,7 @@ const getReceipts = async (req, res) => {
     res.json(data);
   } catch (err) {
     logger.error(`Error getReceipts: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while fetching receipts.' });
+    res.status(500).json(errBody('An error occurred while fetching receipts.'));
   }
 };
 
@@ -1459,7 +1604,7 @@ const getWriteOffs = async (req, res) => {
     res.json(data);
   } catch (err) {
     logger.error(`Error getWriteOffs: ${err.message}`);
-    res.status(500).json({ error: 'An error occurred while fetching write-offs.' });
+    res.status(500).json(errBody('An error occurred while fetching write-offs.'));
   }
 };
 
@@ -1511,6 +1656,16 @@ async function _createTransactionEntry(trxOrDb, { orgId, clientId, bookingId, in
   return id;
 }
 
+// Thrown inside a transaction when the locked row is no longer in the state
+// the request expects (a concurrent approval won the race).
+class StateConflict extends Error {
+  constructor(message, status = 409) { super(message); this.status = status; }
+}
+
+// Maker-checker: the user who raised a request may not approve it.
+const _isOwnRequest = (row, userId) =>
+  userId != null && [row?.created_by, row?.requested_by].some((v) => v != null && String(v) === String(userId));
+
 function _determineApprovalLevel(amount) {
   if (amount <= 500) return 'L1';
   if (amount <= 5000) return 'L2';
@@ -1557,8 +1712,8 @@ const getTransactionLedger = async (req, res) => {
     const [{ total }] = await countQ.count('id as total');
     return res.json({ data, total, limit: parseInt(limit), offset: parseInt(offset) });
   } catch (err) {
-    console.error('getTransactionLedger error', err);
-    return res.status(500).json({ error: 'Failed to fetch transaction ledger' });
+    logger.error(`getTransactionLedger error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to fetch transaction ledger'));
   }
 };
 
@@ -1603,8 +1758,8 @@ const getClientOutstanding = async (req, res) => {
       outstandingAmount,
     });
   } catch (err) {
-    console.error('getClientOutstanding error', err);
-    return res.status(500).json({ error: 'Failed to compute outstanding' });
+    logger.error(`getClientOutstanding error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to compute outstanding'));
   }
 };
 
@@ -1638,8 +1793,8 @@ const getBookingOutstanding = async (req, res) => {
       outstandingAmount,
     });
   } catch (err) {
-    console.error('getBookingOutstanding error', err);
-    return res.status(500).json({ error: 'Failed to compute booking outstanding' });
+    logger.error(`getBookingOutstanding error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to compute booking outstanding'));
   }
 };
 
@@ -1651,16 +1806,16 @@ const createWriteOffV2 = async (req, res) => {
     const userId = req.login_data.id;
     const { booking_id, user_id, write_off_type = 'BAD_DEBT', invoice_ids = [], write_off_amount, reason, remarks } = req.body;
 
-    if (!booking_id || !write_off_amount || !reason) return res.status(400).json({ error: 'booking_id, write_off_amount and reason are required' });
+    if (!booking_id || !write_off_amount || !reason) return res.status(400).json(errBody('booking_id, write_off_amount and reason are required'));
     const amount = parseFloat(write_off_amount);
-    if (isNaN(amount) || amount <= 0) return res.status(400).json({ error: 'write_off_amount must be a positive number' });
+    if (isNaN(amount) || amount <= 0) return res.status(400).json(errBody('write_off_amount must be a positive number'));
 
     const booking = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first();
-    if (!booking) return res.status(404).json({ error: 'Booking not found' });
-    if (booking.status == 6) return res.status(400).json({ error: 'Cannot write off a cancelled booking' });
+    if (!booking) return res.status(404).json(errBody('Booking not found'));
+    if (booking.status == 6) return res.status(400).json(errBody('Cannot write off a cancelled booking'));
 
     const existing = await db('edx_write_offs').where({ booking_id, org_id: orgId, status: 'Pending' }).first();
-    if (existing) return res.status(400).json({ error: 'A pending write-off already exists for this booking' });
+    if (existing) return res.status(400).json(errBody('A pending write-off already exists for this booking'));
 
     const approvalLevel = _determineApprovalLevel(amount);
     const now = getCurrentDateTime();
@@ -1691,8 +1846,8 @@ const createWriteOffV2 = async (req, res) => {
     const created = await db('edx_write_offs').where('id', id).first();
     return res.json(created);
   } catch (err) {
-    console.error('createWriteOffV2 error', err);
-    return res.status(500).json({ error: 'Failed to create write-off' });
+    logger.error(`createWriteOffV2 error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to create write-off'));
   }
 };
 
@@ -1703,24 +1858,30 @@ const approveWriteOff = async (req, res) => {
     const orgId = getOrgId(req);
     const userId = req.login_data.id;
     const { write_off_id, action, notes } = req.body;
-    if (!write_off_id || !action) return res.status(400).json({ error: 'write_off_id and action required' });
-    if (!['Approved', 'Rejected'].includes(action)) return res.status(400).json({ error: 'action must be Approved or Rejected' });
+    if (!write_off_id || !action) return res.status(400).json(errBody('write_off_id and action required'));
+    if (!['Approved', 'Rejected'].includes(action)) return res.status(400).json(errBody('action must be Approved or Rejected'));
 
     const wo = await db('edx_write_offs').where({ id: write_off_id, org_id: orgId }).first();
-    if (!wo) return res.status(404).json({ error: 'Write-off not found' });
-    if (wo.status !== 'Pending') return res.status(400).json({ error: 'Only Pending write-offs can be approved or rejected' });
+    if (!wo) return res.status(404).json(errBody('Write-off not found'));
+    if (wo.status !== 'Pending') return res.status(400).json(errBody('Only Pending write-offs can be approved or rejected'));
+    if (action === 'Approved' && _isOwnRequest(wo, userId)) {
+      return res.status(403).json(errBody('You cannot approve a write-off you created.'));
+    }
 
     const now = getCurrentDateTime();
 
     if (action === 'Approved') {
       await withTransaction(async (trx) => {
-        const booking = await trx('edx_bookings').where('id', wo.booking_id).first();
+        // Re-read under a row lock so two approvers cannot both post the ledger entry.
+        const locked = await trx('edx_write_offs').where({ id: wo.id, org_id: orgId }).forUpdate().first();
+        if (!locked || locked.status !== 'Pending') throw new StateConflict('Write-off was already processed.');
+        const booking = await trx('edx_bookings').where({ id: locked.booking_id, org_id: orgId }).first();
         const entryId = await _createTransactionEntry(trx, {
-          orgId, clientId: wo.user_id || booking.user_id, bookingId: wo.booking_id,
+          orgId, clientId: locked.user_id || booking?.user_id, bookingId: locked.booking_id,
           transactionType: 'WRITE_OFF', direction: 'CREDIT',
-          amount: parseFloat(wo.write_off_amount),
-          referenceId: wo.id, referenceType: 'WRITE_OFF',
-          description: 'Write-off approved: ' + wo.reason,
+          amount: parseFloat(locked.write_off_amount),
+          referenceId: locked.id, referenceType: 'WRITE_OFF',
+          description: 'Write-off approved: ' + locked.reason,
           createdBy: userId,
         });
         await trx('edx_write_offs').where('id', wo.id).update({
@@ -1734,7 +1895,9 @@ const approveWriteOff = async (req, res) => {
         });
       });
     } else {
-      await db('edx_write_offs').where('id', wo.id).update({ status: 'Rejected', updated_by: userId, updated_on: now });
+      const changed = await db('edx_write_offs').where({ id: wo.id, org_id: orgId, status: 'Pending' })
+        .update({ status: 'Rejected', updated_by: userId, updated_on: now });
+      if (!changed) return res.status(409).json(errBody('Write-off was already processed.'));
       await _addApprovalHistory(db, {
         orgId, referenceType: 'WRITE_OFF', referenceId: wo.id, action: 'REJECTED', actionBy: userId, notes,
       });
@@ -1744,8 +1907,9 @@ const approveWriteOff = async (req, res) => {
     const history = await db('edx_approval_history').where({ reference_type: 'WRITE_OFF', reference_id: wo.id, org_id: orgId }).orderBy('id');
     return res.json({ ...updated, approval_history: history });
   } catch (err) {
-    console.error('approveWriteOff error', err);
-    return res.status(500).json({ error: 'Failed to update write-off status' });
+    if (err instanceof StateConflict) return res.status(err.status).json(errBody(err.message));
+    logger.error(`approveWriteOff error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to update write-off status'));
   }
 };
 
@@ -1758,18 +1922,18 @@ const createRefund = async (req, res) => {
     const { booking_id, client_id, invoice_id, receipt_ids = [], refund_amount, refund_channel, refund_reason, channel_details = {}, notes } = req.body;
 
     if (!booking_id || !refund_amount || !refund_channel || !refund_reason) {
-      return res.status(400).json({ error: 'booking_id, refund_amount, refund_channel, refund_reason are required' });
+      return res.status(400).json(errBody('booking_id, refund_amount, refund_channel, refund_reason are required'));
     }
     const amount = parseFloat(refund_amount);
-    if (isNaN(amount) || amount <= 0) return res.status(400).json({ error: 'refund_amount must be positive' });
+    if (isNaN(amount) || amount <= 0) return res.status(400).json(errBody('refund_amount must be positive'));
 
     const booking = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first();
-    if (!booking) return res.status(404).json({ error: 'Booking not found' });
+    if (!booking) return res.status(404).json(errBody('Booking not found'));
 
     const paidRows = await db('edx_receipts').where({ booking_id, org_id: orgId, status: 'Approved' }).sum('total_amount as total').first();
     const alreadyRefunded = await db('edx_refunds').where({ booking_id, org_id: orgId }).whereIn('status', ['APPROVED', 'PROCESSING', 'COMPLETED']).sum('refund_amount as total').first();
     const maxRefund = (parseFloat(paidRows?.total) || 0) - (parseFloat(alreadyRefunded?.total) || 0);
-    if (amount > maxRefund) return res.status(400).json({ error: 'Refund amount exceeds refundable balance of ' + maxRefund });
+    if (amount > maxRefund) return res.status(400).json(errBody('Refund amount exceeds refundable balance of ' + maxRefund));
 
     const approvalLevel = _determineApprovalLevel(amount);
     const now = getCurrentDateTime();
@@ -1801,8 +1965,8 @@ const createRefund = async (req, res) => {
     const created = await db('edx_refunds').where('id', id).first();
     return res.json(created);
   } catch (err) {
-    console.error('createRefund error', err);
-    return res.status(500).json({ error: 'Failed to create refund' });
+    logger.error(`createRefund error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to create refund'));
   }
 };
 
@@ -1828,8 +1992,8 @@ const getRefunds = async (req, res) => {
     const data = await q;
     return res.json(data);
   } catch (err) {
-    console.error('getRefunds error', err);
-    return res.status(500).json({ error: 'Failed to fetch refunds' });
+    logger.error(`getRefunds error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to fetch refunds'));
   }
 };
 
@@ -1847,12 +2011,12 @@ const getRefundById = async (req, res) => {
         db.raw("IFNULL(u.user_name, '') as client_name"),
         db.raw("CONCAT('BK-', LPAD(b.id, 6, '0')) as booking_ref")
       ).first();
-    if (!refund) return res.status(404).json({ error: 'Refund not found' });
+    if (!refund) return res.status(404).json(errBody('Refund not found'));
     const history = await db('edx_approval_history').where({ reference_type: 'REFUND', reference_id: id, org_id: orgId }).orderBy('id');
     return res.json({ ...refund, approval_history: history });
   } catch (err) {
-    console.error('getRefundById error', err);
-    return res.status(500).json({ error: 'Failed to fetch refund' });
+    logger.error(`getRefundById error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to fetch refund'));
   }
 };
 
@@ -1863,15 +2027,18 @@ const approveRefund = async (req, res) => {
     const orgId = getOrgId(req);
     const userId = req.login_data.id;
     const { refund_id, action, notes, dispatch_details } = req.body;
-    if (!refund_id || !action) return res.status(400).json({ error: 'refund_id and action required' });
+    if (!refund_id || !action) return res.status(400).json(errBody('refund_id and action required'));
 
     const refund = await db('edx_refunds').where({ id: refund_id, org_id: orgId }).first();
-    if (!refund) return res.status(404).json({ error: 'Refund not found' });
+    if (!refund) return res.status(404).json(errBody('Refund not found'));
 
     const now = getCurrentDateTime();
     const allowed = { PENDING_APPROVAL: ['Approved', 'Rejected'], APPROVED: ['Processing'], PROCESSING: ['Completed'] };
     if (!allowed[refund.status]?.includes(action)) {
-      return res.status(400).json({ error: 'Invalid status transition: ' + refund.status + ' → ' + action });
+      return res.status(400).json(errBody('Invalid status transition: ' + refund.status + ' → ' + action));
+    }
+    if (action === 'Approved' && _isOwnRequest(refund, userId)) {
+      return res.status(403).json(errBody('You cannot approve a refund you requested.'));
     }
 
     const updates = { updated_by: userId, updated_on: now };
@@ -1886,6 +2053,8 @@ const approveRefund = async (req, res) => {
       Object.assign(updates, { status: 'PROCESSING', processed_by: userId });
     } else if (action === 'Completed') {
       await withTransaction(async (trx) => {
+        const locked = await trx('edx_refunds').where({ id: refund.id, org_id: orgId }).forUpdate().first();
+        if (!locked || locked.status !== 'PROCESSING') throw new StateConflict('Refund was already processed.');
         const entryId = await _createTransactionEntry(trx, {
           orgId, clientId: refund.client_id, bookingId: refund.booking_id,
           transactionType: 'REFUND', direction: 'DEBIT',
@@ -1899,7 +2068,7 @@ const approveRefund = async (req, res) => {
           transaction_entry_id: entryId,
           dispatch_details: dispatch_details ? JSON.stringify(dispatch_details) : refund.dispatch_details,
         });
-        await trx('edx_refunds').where('id', refund.id).update(updates);
+        await trx('edx_refunds').where({ id: refund.id, org_id: orgId }).update(updates);
         await _addApprovalHistory(trx, { orgId, referenceType: 'REFUND', referenceId: refund.id, action: 'APPROVED', actionBy: userId, notes });
       });
       const updated = await db('edx_refunds').where('id', refund.id).first();
@@ -1907,14 +2076,17 @@ const approveRefund = async (req, res) => {
       return res.json({ ...updated, approval_history: history });
     }
 
-    await db('edx_refunds').where('id', refund.id).update(updates);
+    // Conditional on the status we validated, so a concurrent transition loses cleanly.
+    const changed = await db('edx_refunds').where({ id: refund.id, org_id: orgId, status: refund.status }).update(updates);
+    if (!changed) return res.status(409).json(errBody('Refund was already processed.'));
     await _addApprovalHistory(db, { orgId, referenceType: 'REFUND', referenceId: refund.id, action: historyAction, actionBy: userId, notes });
     const updated = await db('edx_refunds').where('id', refund.id).first();
     const history = await db('edx_approval_history').where({ reference_type: 'REFUND', reference_id: refund.id, org_id: orgId }).orderBy('id');
     return res.json({ ...updated, approval_history: history });
   } catch (err) {
-    console.error('approveRefund error', err);
-    return res.status(500).json({ error: 'Failed to update refund status' });
+    if (err instanceof StateConflict) return res.status(err.status).json(errBody(err.message));
+    logger.error(`approveRefund error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to update refund status'));
   }
 };
 
@@ -1926,27 +2098,41 @@ const applyCreditNote = async (req, res) => {
     const userId = req.login_data.id;
     const { credit_note_id, target_booking_id, target_invoice_id, amount_to_apply, notes } = req.body;
     if (!credit_note_id || !target_booking_id || !target_invoice_id || !amount_to_apply) {
-      return res.status(400).json({ error: 'credit_note_id, target_booking_id, target_invoice_id, amount_to_apply required' });
+      return res.status(400).json(errBody('credit_note_id, target_booking_id, target_invoice_id, amount_to_apply required'));
     }
     const applyAmt = parseFloat(amount_to_apply);
+    if (!Number.isFinite(applyAmt) || applyAmt <= 0) {
+      return res.status(400).json(errBody('amount_to_apply must be greater than zero'));
+    }
     const cn = await db('edx_credit_notes').where({ id: credit_note_id, org_id: orgId }).first();
-    if (!cn) return res.status(404).json({ error: 'Credit note not found' });
+    if (!cn) return res.status(404).json(errBody('Credit note not found'));
     const remaining = parseFloat(cn.remaining_amount ?? cn.amount);
-    if (remaining < applyAmt) return res.status(400).json({ error: 'Amount exceeds credit note remaining balance of ' + remaining });
-    if (!['Approved'].includes(cn.status)) return res.status(400).json({ error: 'Credit note must be Approved to apply' });
+    if (remaining < applyAmt) return res.status(400).json(errBody('Amount exceeds credit note remaining balance of ' + remaining));
+    if (!['Approved'].includes(cn.status)) return res.status(400).json(errBody('Credit note must be Approved to apply'));
 
     const invoice = await db('edx_invoice').where({ id: target_invoice_id, org_id: orgId }).first();
-    if (!invoice) return res.status(404).json({ error: 'Target invoice not found' });
+    if (!invoice) return res.status(404).json(errBody('Target invoice not found'));
+    if (invoice.booking_id != null && String(invoice.booking_id) !== String(target_booking_id)) {
+      return res.status(400).json(errBody('Target invoice does not belong to the target booking'));
+    }
 
     const targetBooking = await db('edx_bookings').where({ id: target_booking_id, org_id: orgId }).first();
-    if (!targetBooking) return res.status(404).json({ error: 'Target booking not found' });
+    if (!targetBooking) return res.status(404).json(errBody('Target booking not found'));
 
     let applicationId;
     await withTransaction(async (trx) => {
-      const newRemaining = remaining - applyAmt;
-      const newUsed = (parseFloat(cn.used_amount) || 0) + applyAmt;
+      // Balance is re-read under a row lock: two concurrent applications must
+      // not both spend the same remaining amount.
+      const locked = await trx('edx_credit_notes').where({ id: credit_note_id, org_id: orgId }).forUpdate().first();
+      if (!locked || locked.status !== 'Approved') throw new StateConflict('Credit note must be Approved to apply', 400);
+      const lockedRemaining = parseFloat(locked.remaining_amount ?? locked.amount);
+      if (!(lockedRemaining >= applyAmt)) {
+        throw new StateConflict('Amount exceeds credit note remaining balance of ' + lockedRemaining, 400);
+      }
+      const newRemaining = lockedRemaining - applyAmt;
+      const newUsed = (parseFloat(locked.used_amount) || 0) + applyAmt;
       const extStatus = newRemaining <= 0 ? 'FULLY_APPLIED' : 'PARTIALLY_APPLIED';
-      await trx('edx_credit_notes').where('id', credit_note_id).update({
+      await trx('edx_credit_notes').where({ id: credit_note_id, org_id: orgId }).update({
         remaining_amount: newRemaining, used_amount: newUsed, extended_status: extStatus,
         updated_on: getCurrentDateTime(), updated_by: userId,
       });
@@ -1971,8 +2157,9 @@ const applyCreditNote = async (req, res) => {
     const application = await db('edx_credit_note_applications').where('id', applicationId).first();
     return res.json(application);
   } catch (err) {
-    console.error('applyCreditNote error', err);
-    return res.status(500).json({ error: 'Failed to apply credit note' });
+    if (err instanceof StateConflict) return res.status(err.status).json(errBody(err.message));
+    logger.error(`applyCreditNote error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to apply credit note'));
   }
 };
 
@@ -1994,8 +2181,8 @@ const getCreditNoteApplications = async (req, res) => {
     const data = await q;
     return res.json(data);
   } catch (err) {
-    console.error('getCreditNoteApplications error', err);
-    return res.status(500).json({ error: 'Failed to fetch credit note applications' });
+    logger.error(`getCreditNoteApplications error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to fetch credit note applications'));
   }
 };
 
@@ -2007,20 +2194,20 @@ const createInternalTransfer = async (req, res) => {
     const userId = req.login_data.id;
     const { client_id, source_booking_id, target_booking_id, transfer_amount, transfer_type, reason, notes } = req.body;
     if (!client_id || !source_booking_id || !target_booking_id || !transfer_amount || !transfer_type || !reason) {
-      return res.status(400).json({ error: 'client_id, source_booking_id, target_booking_id, transfer_amount, transfer_type, reason are required' });
+      return res.status(400).json(errBody('client_id, source_booking_id, target_booking_id, transfer_amount, transfer_type, reason are required'));
     }
-    if (source_booking_id == target_booking_id) return res.status(400).json({ error: 'Source and target bookings must be different' });
+    if (source_booking_id == target_booking_id) return res.status(400).json(errBody('Source and target bookings must be different'));
 
     const amount = parseFloat(transfer_amount);
-    if (isNaN(amount) || amount <= 0) return res.status(400).json({ error: 'transfer_amount must be positive' });
+    if (isNaN(amount) || amount <= 0) return res.status(400).json(errBody('transfer_amount must be positive'));
 
     const [srcBk, tgtBk] = await Promise.all([
       db('edx_bookings').where({ id: source_booking_id, org_id: orgId }).first(),
       db('edx_bookings').where({ id: target_booking_id, org_id: orgId }).first(),
     ]);
-    if (!srcBk) return res.status(404).json({ error: 'Source booking not found' });
-    if (!tgtBk) return res.status(404).json({ error: 'Target booking not found' });
-    if (srcBk.user_id != tgtBk.user_id) return res.status(400).json({ error: 'Both bookings must belong to the same client' });
+    if (!srcBk) return res.status(404).json(errBody('Source booking not found'));
+    if (!tgtBk) return res.status(404).json(errBody('Target booking not found'));
+    if (srcBk.user_id != tgtBk.user_id) return res.status(400).json(errBody('Both bookings must belong to the same client'));
 
     const now = getCurrentDateTime();
     const [id] = await db('edx_internal_transfers').insert(withOrg(req, {
@@ -2044,8 +2231,8 @@ const createInternalTransfer = async (req, res) => {
     const created = await db('edx_internal_transfers').where('id', id).first();
     return res.json(created);
   } catch (err) {
-    console.error('createInternalTransfer error', err);
-    return res.status(500).json({ error: 'Failed to create internal transfer' });
+    logger.error(`createInternalTransfer error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to create internal transfer'));
   }
 };
 
@@ -2070,8 +2257,8 @@ const getInternalTransfers = async (req, res) => {
     const data = await q;
     return res.json(data);
   } catch (err) {
-    console.error('getInternalTransfers error', err);
-    return res.status(500).json({ error: 'Failed to fetch transfers' });
+    logger.error(`getInternalTransfers error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to fetch transfers'));
   }
 };
 
@@ -2082,17 +2269,22 @@ const approveInternalTransfer = async (req, res) => {
     const orgId = getOrgId(req);
     const userId = req.login_data.id;
     const { transfer_id, action, notes } = req.body;
-    if (!transfer_id || !action) return res.status(400).json({ error: 'transfer_id and action required' });
-    if (!['Approved', 'Rejected'].includes(action)) return res.status(400).json({ error: 'action must be Approved or Rejected' });
+    if (!transfer_id || !action) return res.status(400).json(errBody('transfer_id and action required'));
+    if (!['Approved', 'Rejected'].includes(action)) return res.status(400).json(errBody('action must be Approved or Rejected'));
 
     const transfer = await db('edx_internal_transfers').where({ id: transfer_id, org_id: orgId }).first();
-    if (!transfer) return res.status(404).json({ error: 'Transfer not found' });
-    if (transfer.status !== 'PENDING_APPROVAL') return res.status(400).json({ error: 'Only PENDING_APPROVAL transfers can be actioned' });
+    if (!transfer) return res.status(404).json(errBody('Transfer not found'));
+    if (transfer.status !== 'PENDING_APPROVAL') return res.status(400).json(errBody('Only PENDING_APPROVAL transfers can be actioned'));
+    if (action === 'Approved' && _isOwnRequest(transfer, userId)) {
+      return res.status(403).json(errBody('You cannot approve a transfer you requested.'));
+    }
 
     const now = getCurrentDateTime();
 
     if (action === 'Approved') {
       await withTransaction(async (trx) => {
+        const locked = await trx('edx_internal_transfers').where({ id: transfer.id, org_id: orgId }).forUpdate().first();
+        if (!locked || locked.status !== 'PENDING_APPROVAL') throw new StateConflict('Transfer was already processed.');
         const outEntryId = await _createTransactionEntry(trx, {
           orgId, clientId: transfer.client_id, bookingId: transfer.source_booking_id,
           transactionType: 'INTERNAL_TRANSFER_OUT', direction: 'DEBIT',
@@ -2109,7 +2301,7 @@ const approveInternalTransfer = async (req, res) => {
           description: 'Internal transfer in from booking #' + transfer.source_booking_id,
           createdBy: userId,
         });
-        await trx('edx_internal_transfers').where('id', transfer.id).update({
+        await trx('edx_internal_transfers').where({ id: transfer.id, org_id: orgId }).update({
           status: 'COMPLETED', approved_by: userId, approved_at: now,
           source_transaction_entry_id: outEntryId, target_transaction_entry_id: inEntryId,
           updated_by: userId, updated_on: now,
@@ -2117,7 +2309,9 @@ const approveInternalTransfer = async (req, res) => {
         await _addApprovalHistory(trx, { orgId, referenceType: 'INTERNAL_TRANSFER', referenceId: transfer.id, action: 'APPROVED', actionBy: userId, notes, approvalLevel: 2 });
       });
     } else {
-      await db('edx_internal_transfers').where('id', transfer.id).update({ status: 'REJECTED', updated_by: userId, updated_on: now });
+      const changed = await db('edx_internal_transfers').where({ id: transfer.id, org_id: orgId, status: 'PENDING_APPROVAL' })
+        .update({ status: 'REJECTED', updated_by: userId, updated_on: now });
+      if (!changed) return res.status(409).json(errBody('Transfer was already processed.'));
       await _addApprovalHistory(db, { orgId, referenceType: 'INTERNAL_TRANSFER', referenceId: transfer.id, action: 'REJECTED', actionBy: userId, notes, approvalLevel: 2 });
     }
 
@@ -2125,12 +2319,13 @@ const approveInternalTransfer = async (req, res) => {
     const history = await db('edx_approval_history').where({ reference_type: 'INTERNAL_TRANSFER', reference_id: transfer.id, org_id: orgId }).orderBy('id');
     return res.json({ ...updated, approval_history: history });
   } catch (err) {
-    console.error('approveInternalTransfer error', err);
-    return res.status(500).json({ error: 'Failed to update transfer status' });
+    if (err instanceof StateConflict) return res.status(err.status).json(errBody(err.message));
+    logger.error(`approveInternalTransfer error: ${err.message}`);
+    return res.status(500).json(errBody('Failed to update transfer status'));
   }
 };
 
-module.exports = {
+module.exports = guardOrgHandlers({
   getActiveClients,
   createProvisionalReceipt,
   updateReceiptStatus,
@@ -2172,5 +2367,5 @@ module.exports = {
   createInternalTransfer,
   getInternalTransfers,
   approveInternalTransfer,
-};
+}, ['razorpayWebhook']);
 

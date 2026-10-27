@@ -2,13 +2,16 @@ const db = require('../../config/db');
 
 
 // Finds or creates a client user scoped to a specific organisation.
-// Token is NOT stored here — the controller generates it after getting the userId,
-// then calls a separate update. org_id is required.
+// Never issues or stores a token (staff create clients via /createClientUser;
+// clients log in via /clientAuth OTP). org_id is required.
 async function upsertUserToken(phone_number, org_id) {
+  // Match on the last 10 digits (same rule as clientAuth) so "+919876543210"
+  // and a legacy bare "9876543210" resolve to the same client.
+  const phone10 = String(phone_number || '').replace(/\D/g, '').slice(-10);
   const existingUser = await db("edx_client_app_users")
     .select("id")
-    .where("phone_number", phone_number)
-    .andWhere("org_id", org_id)
+    .where("org_id", org_id)
+    .whereRaw("RIGHT(REPLACE(REPLACE(phone_number, '+', ''), ' ', ''), 10) = ?", [phone10])
     .first();
 
   if (existingUser) {
@@ -51,16 +54,41 @@ async function getDetails (filters = {})
     if (phone_number) query.where('edx_client_app_users.phone_number', phone_number);
     if (org_id) query.where('edx_client_app_users.org_id', org_id);
 
-
- return query;
+ // user_token is a legacy session credential — never return it.
+ const rows = await query;
+ return rows.map(({ user_token, ...rest }) => rest);
 };
 
 async function getWebEmpDetailsModel (filters = {})
 {
    const { id, user_mobile, user_role, org_id } = filters;
 
+ // Explicit columns — a bare select('*') across the join collides on shared
+ // names (id, org_id, status, created_on…) so `id` ends up being the role's id,
+ // which then drives edit/terminate against the wrong row. Keep the user row
+ // intact and pull only the role fields the UI needs.
  let query = db('edx_web_app_users')
-   .select('*')
+   // Never select user_password / password_reset_* / tokens_valid_after.
+   .select(
+     'edx_web_app_users.id',
+     'edx_web_app_users.user_name',
+     'edx_web_app_users.user_gender',
+     'edx_web_app_users.user_mobile',
+     'edx_web_app_users.user_email',
+     'edx_web_app_users.user_role',
+     'edx_web_app_users.user_home_branch',
+     'edx_web_app_users.user_branch_access',
+     'edx_web_app_users.user_image',
+     'edx_web_app_users.user_status',
+     'edx_web_app_users.user_status as status',
+     'edx_web_app_users.org_id',
+     'edx_web_app_users.created_by',
+     'edx_web_app_users.created_on',
+     'edx_web_app_users.updated_by',
+     'edx_web_app_users.updated_on',
+     'edx_web_emp_roles.role_name',
+     'edx_web_emp_roles.access_list',
+   )
    .where('user_status','1')
    .leftJoin('edx_web_emp_roles','edx_web_emp_roles.id','edx_web_app_users.user_role')
     // console.log(query.toString());

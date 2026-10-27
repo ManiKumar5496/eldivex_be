@@ -15,6 +15,8 @@
 const db = require('../../config/db');
 const logger = require('../../logger');
 const applyBranchFilter = require('../../utils/applyBranchFilter');
+const { getOrgId } = require('../../utils/orgScope');
+const { guardOrgHandlers } = require('../../utils/requestOrg');
 
 // Day-of-week mapping: MySQL DAYOFWEEK returns 1=Sun … 7=Sat
 const DOW_TO_NAME = { 1: 'Sun', 2: 'Mon', 3: 'Tue', 4: 'Wed', 5: 'Thu', 6: 'Fri', 7: 'Sat' };
@@ -28,7 +30,7 @@ const CANCELLED_STATUSES = ['3', '6'];
 // Apply org isolation + JWT branch access + optional explicit branch + date range
 // to a query whose bookings table is aliased `b`.
 function applyFilters(query, user, branchCol, { from, to, branch_id } = {}) {
-  query = query.where('b.org_id', user.org_id ?? 1);
+  query = query.where('b.org_id', user.org_id);
   query = applyBranchFilter(query, user, branchCol);
   if (branch_id) query = query.where(branchCol, branch_id);
   if (from && to) {
@@ -39,9 +41,11 @@ function applyFilters(query, user, branchCol, { from, to, branch_id } = {}) {
 
 // Is this caller scoped to one or more specific branches?
 // (explicit branch_id filter, or a non-superadmin with branch_access)
+// Mirrors applyBranchFilter: only role 1 or branch_access 'all' is unrestricted.
 function isBranchScoped(user, branch_id) {
   if (branch_id) return true;
-  return user.role_id !== 1 && !!user.branch_access;
+  if (Number(user.role_id) === 1) return false;
+  return String(user.branch_access ?? '').trim().toLowerCase() !== 'all';
 }
 
 // Compute the equal-length window immediately preceding [from, to].
@@ -135,7 +139,7 @@ function clientsFor(user, branch_id, opts) {
       user, 'b.branch_id', opts
     ).then(r => Number(r?.count) || 0);
   }
-  let q = db('edx_client_app_users').where('org_id', user.org_id ?? 1);
+  let q = db('edx_client_app_users').where('org_id', user.org_id);
   if (opts.from && opts.to) {
     q = q.whereBetween('created_on', [`${opts.from} 00:00:00`, `${opts.to} 23:59:59`]);
   }
@@ -146,7 +150,8 @@ function clientsFor(user, branch_id, opts) {
 
 const getDashboardStats = async (req, res) => {
   try {
-    const user      = req.login_data;
+    // org_id always from getOrgId (never a default org; guarded → 401 when null)
+    const user      = { ...req.login_data, org_id: getOrgId(req) };
     const branch_id = req.query.branch_id ? parseInt(req.query.branch_id) : null;
 
     // Default date range: last 30 days
@@ -197,7 +202,7 @@ const getDashboardStats = async (req, res) => {
       // ── Weekly bookings: last 7 days grouped by day-of-week ───────────────
       applyBranchFilter(
         db('edx_bookings as b')
-          .where('b.org_id', user.org_id ?? 1)
+          .where('b.org_id', user.org_id)
           .whereRaw('b.created_on >= DATE_SUB(NOW(), INTERVAL 7 DAY)')
           .select(
             db.raw('DAYOFWEEK(b.created_on) AS dow'),
@@ -213,10 +218,10 @@ const getDashboardStats = async (req, res) => {
           .leftJoin('edx_master_services as ms', 'b.service_type_id', 'ms.id')
           .leftJoin('edx_master_services_category as msc', 'ms.service_category_id', 'msc.id')
           .select(
-            db.raw("COALESCE(msc.category_name, 'Other') AS service_name"),
+            db.raw("COALESCE(msc.name, 'Other') AS service_name"),
             db.raw('COUNT(b.id)                AS count')
           )
-          .groupBy('msc.id', 'msc.category_name')
+          .groupBy('msc.id', 'msc.name')
           .orderBy('count', 'desc')
           .limit(6),
         user, 'b.branch_id', opts
@@ -266,7 +271,7 @@ const getDashboardStats = async (req, res) => {
       // ── Total approved HPs ────────────────────────────────────────────────
       applyBranchFilter(
         db('edx_hp_registration')
-          .where('org_id', user.org_id ?? 1)
+          .where('org_id', user.org_id)
           .where('hp_reg_status', 2)           // 2 = Approved
           .count('* as count')
           .first(),
@@ -352,9 +357,9 @@ const getDashboardStats = async (req, res) => {
       })),
     });
   } catch (error) {
-    logger.error('[dashboardController] getDashboardStats error:', error);
-    res.status(500).json({ message: 'Failed to fetch dashboard stats.', details: error.message });
+    logger.error(`[dashboardController] getDashboardStats error: ${error.message}`);
+    res.status(500).json({ message: 'Failed to fetch dashboard stats.' });
   }
 };
 
-module.exports = { getDashboardStats };
+module.exports = guardOrgHandlers({ getDashboardStats });

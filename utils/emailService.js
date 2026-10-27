@@ -31,20 +31,25 @@ function getTransporter() {
 }
 
 /**
- * @param {{ to: string, subject: string, html: string }} options
+ * @param {{ to: string, subject: string, html: string, fromName?: string }} options
+ *   fromName — display name for the sender (e.g. the organisation's name for
+ *   tenant-branded invoices/receipts). Defaults to the platform name.
+ *   attachments — optional nodemailer attachments ([{ filename, content }]).
  */
-async function sendEmail({ to, subject, html }) {
+async function sendEmail({ to, subject, html, fromName, attachments }) {
   if (!process.env.EMAIL_USER || !process.env.EMAIL_PASS) {
     console.warn('[emailService] EMAIL_USER / EMAIL_PASS not set — skipping email to:', to);
     return;
   }
 
+  const displayName = String(fromName || 'Eldivex').replace(/["\r\n]/g, '').trim() || 'Eldivex';
   const transporter = getTransporter();
   await transporter.sendMail({
-    from:    `"Eldivex" <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
+    from:    `"${displayName}" <${process.env.EMAIL_FROM || process.env.EMAIL_USER}>`,
     to,
     subject,
     html,
+    ...(Array.isArray(attachments) && attachments.length ? { attachments } : {}),
   });
 }
 

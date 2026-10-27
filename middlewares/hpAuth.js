@@ -31,7 +31,12 @@ const hpAuth = (req, res, next) => {
       return res.status(403).json({ error: 'Not a caregiver session' });
     }
 
-    req.hp = { hp_id: decoded.hp_id, org_id: decoded.org_id ?? 1 };
+    // No org claim → no tenant scope; never fall back to a default org.
+    if (!decoded.org_id) {
+      return res.status(401).json({ error: 'Invalid token for this endpoint' });
+    }
+
+    req.hp = { hp_id: decoded.hp_id, org_id: decoded.org_id };
     next();
   } catch (err) {
     return res.status(403).json({ error: 'Invalid or expired token' });

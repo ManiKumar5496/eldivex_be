@@ -33,6 +33,35 @@ function validateEnv() {
     if (!process.env.DOC_FOLDER_URL?.startsWith('https://')) {
       errors.push('DOC_FOLDER_URL must use HTTPS in production.');
     }
+    // Platform-owner credentials must be provided explicitly — no baked-in default.
+    if (!process.env.OWNER_EMAIL) {
+      errors.push('OWNER_EMAIL must be set in production.');
+    }
+    if (!process.env.OWNER_PASSWORD_HASH) {
+      errors.push('OWNER_PASSWORD_HASH (bcrypt hash) must be set in production.');
+    }
+    // Static-OTP test backdoors must never be enabled in production.
+    if (process.env.HP_STATIC_OTP || process.env.CLIENT_STATIC_OTP) {
+      errors.push('HP_STATIC_OTP / CLIENT_STATIC_OTP must not be set in production.');
+    }
+  }
+
+  // ── Optional feature flags (all default off) ──────────────────────────────
+  //   EXPOSE_DEV_OTP=true            return dev_otp / honour *_STATIC_OTP —
+  //                                  only when NODE_ENV=development
+  //   FORCE_HTTPS=true               301 HTTP→HTTPS (behind a TLS proxy)
+  //   TRUST_PROXY=1                  trust X-Forwarded-* (behind a proxy only)
+  //   ENFORCE_PLAN_LIMITS=true       enforce booking_limit / hp_limit
+  //   ENABLE_SUBSCRIPTION_EXPIRY=true  expiry cron acts (else logs only)
+  if (process.env.EXPOSE_DEV_OTP === 'true' && process.env.NODE_ENV === 'production') {
+    errors.push('EXPOSE_DEV_OTP must not be true in production.');
+  }
+  const BOOL_FLAGS = ['EXPOSE_DEV_OTP', 'FORCE_HTTPS', 'ENFORCE_PLAN_LIMITS', 'ENABLE_SUBSCRIPTION_EXPIRY'];
+  for (const flag of BOOL_FLAGS) {
+    const v = process.env[flag];
+    if (v !== undefined && v !== '' && v !== 'true' && v !== 'false') {
+      errors.push(`${flag} must be "true" or "false" (got "${v}").`);
+    }
   }
 
   // ── Report ────────────────────────────────────────────────────────────────
@@ -51,6 +80,9 @@ function validateEnv() {
   }
   if (!process.env.SMS_API_KEY) {
     console.warn('⚠️  SMS_API_KEY not set — SMS notifications are disabled.');
+  }
+  if (process.env.EXPOSE_DEV_OTP === 'true' && process.env.NODE_ENV !== 'development') {
+    console.warn('⚠️  EXPOSE_DEV_OTP is ignored unless NODE_ENV=development.');
   }
   if (!process.env.APP_BASE_URL) {
     console.warn('⚠️  APP_BASE_URL not set — password reset links will use placeholder URL.');

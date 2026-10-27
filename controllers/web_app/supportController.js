@@ -6,6 +6,9 @@ const { sendEmail } = require('../../utils/emailService');
 const { supportTicketCreated } = require('../../utils/emailTemplates');
 const { logAudit } = require('../../utils/auditLogger'); // Phase 4.2
 const { withOrg, orgQuery, getOrgId } = require('../../utils/orgScope'); // Phase 5
+const { notifyOrgAdmins } = require('../../utils/notify');
+const { getClientContact } = require('../../utils/clientContact');
+const { guardOrgHandlers, resolveRequestOrgId } = require('../../utils/requestOrg');
 
 const createSupportTicket = async (req, res) => {
   try {
@@ -21,6 +24,17 @@ const createSupportTicket = async (req, res) => {
       created_by_employee,
       booking_details,
     } = req.body;
+    const orgId = getOrgId(req);
+
+    // Category and client must belong to the caller's org.
+    if (support_type_id && support_type_id !== 'NA') {
+      const cat = await db('edx_support_category').where({ id: support_type_id, org_id: orgId }).first('id');
+      if (!cat) return res.status(404).json({ message: 'Support category not found.' });
+    }
+    if (user_id && user_id !== 'NA') {
+      const client = await db('edx_client_app_users').where({ id: user_id, org_id: orgId }).first('id');
+      if (!client) return res.status(404).json({ message: 'Client not found.' });
+    }
 
     const [id] = await db('edx_support_requests').insert(withOrg(req, {
       user_id:                user_id                ? user_id                : 'NA',
@@ -44,19 +58,24 @@ const createSupportTicket = async (req, res) => {
       entityId:   id,
       action:     'CREATE',
       changedBy:  req.login_data?.id || null,
-      org_id:     req.login_data?.org_id ?? 1,
+      org_id:     orgId,
       newValues:  { id, title, support_type_id, user_id },
+    });
+
+    notifyOrgAdmins(orgId, {
+      type:  'support',
+      title: `New support ticket #${id}`,
+      body:  title && title !== 'NA' ? title : 'A new support request was raised.',
+      data:  { ticket_id: id, route: 'support' },
     });
 
     // ── Send ACK email to client (non-blocking) ──────────────────────────────
     setImmediate(async () => {
       try {
         if (user_id && user_id !== 'NA') {
-          const user = await db('edx_web_app_users')
-            .where({ id: user_id })
-            .select('user_email', 'user_name')
-            .first();
-          if (user && user.user_email && user.user_email !== 'NA') {
+          // Ticket user_id is a CLIENT id — resolve it in edx_client_app_users.
+          const user = await getClientContact(user_id, orgId);
+          if (user && user.user_email) {
             const tpl = supportTicketCreated({
               clientName: user.user_name || 'Client',
               ticketId:   id,
@@ -88,10 +107,14 @@ const getSupportTickets = async (req, res) => {
   }
 };
 
+// Public (used before login too): org from a tenant token or ?org_id / ?org_code.
+// Without an org we refuse instead of returning every tenant's categories.
 const getSupportCategory = async (req, res) => {
   try {
-    const filters = req.query;
-    const data = await supportModel.getSupportCategoryData(filters);
+    const orgId = await resolveRequestOrgId(req);
+    if (!orgId) return res.status(400).json({ error: 'org context is required' });
+    const appType = ['web', 'client', 'hp'].includes(req.query.app_type) ? req.query.app_type : null;
+    const data = await supportModel.getSupportCategoryData(req.query, orgId, appType);
     res.json(data);
   } catch (err) {
     logger.error(`Error fetching support categories: ${err.message}`);
@@ -167,9 +190,9 @@ const getSupportStats = async (req, res) => {
   }
 };
 
-module.exports = {
+module.exports = guardOrgHandlers({
   createSupportTicket,
   getSupportTickets,
   getSupportCategory,
   getSupportStats,
-};
+}, ['getSupportCategory']);

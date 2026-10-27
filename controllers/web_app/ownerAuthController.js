@@ -6,8 +6,10 @@
  * NOT role 1 ("Super Admin" is just the eldivex_web tenant's admin role) —
  * the owner is identified by hardcoded credentials and an is_owner JWT claim.
  *
- * Credentials can be overridden via OWNER_EMAIL / OWNER_PASSWORD_HASH env vars
- * (hash = bcrypt). Defaults are baked in below.
+ * Credentials MUST be provided via OWNER_EMAIL / OWNER_PASSWORD_HASH env vars
+ * (hash = bcrypt). There are no baked-in defaults — startup fails (see
+ * config/envValidator.js) if they are unset, so a real credential is always
+ * required and none is ever committed to source.
  */
 
 const bcrypt = require('bcrypt');
@@ -15,16 +17,19 @@ const logger = require('../../logger');
 const { generateOwnerToken } = require('../../utils/jwt');
 require('dotenv').config();
 
-const OWNER_EMAIL = process.env.OWNER_EMAIL || 'penuboinamanikumar@gmail.com';
-const OWNER_PASSWORD_HASH =
-  process.env.OWNER_PASSWORD_HASH ||
-  '$2b$10$e7LNpJU4uvxqsOSwhKQrAeFrvxbEvS/6WBJL8rm3MdzeraLkGThVS';
+const OWNER_EMAIL = process.env.OWNER_EMAIL;
+const OWNER_PASSWORD_HASH = process.env.OWNER_PASSWORD_HASH;
 
 const ownerLogin = async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
       return res.status(400).json({ message: 'Email and password are required' });
+    }
+
+    if (!OWNER_EMAIL || !OWNER_PASSWORD_HASH) {
+      logger.error('[ownerAuth] OWNER_EMAIL / OWNER_PASSWORD_HASH not configured');
+      return res.status(500).json({ message: 'Owner login is not configured' });
     }
 
     const emailOk = email.trim().toLowerCase() === OWNER_EMAIL.toLowerCase();

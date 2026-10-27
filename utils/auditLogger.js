@@ -14,6 +14,7 @@
  *     entityId:   booking_id,          // PK of the changed record
  *     action:     'CREATE',            // 'CREATE' | 'UPDATE' | 'STATUS_CHANGE' | 'DELETE'
  *     changedBy:  req.login_data?.id,  // web_app_users.id (may be null)
+ *     org_id:     getOrgId(req),       // required — the row is skipped when unknown
  *     oldValues:  null,                // object snapshot before (omit / null for CREATE)
  *     newValues:  { status: 'HOLD' },  // object snapshot after
  *   });
@@ -32,6 +33,13 @@ const logger = require('../logger');
  * @param {Object|null} entry.newValues
  */
 function logAudit({ entityType, entityId, action, changedBy, org_id, oldValues, newValues }) {
+  // Never attribute a row to a default org. Tenant callers pass the JWT org,
+  // owner actions pass the target org (or 0 for platform-level entities such
+  // as plans). Unknown org → skip rather than pollute org 1's trail.
+  if (org_id === undefined || org_id === null || org_id === '') {
+    logger.warn(`[audit] skipped — no org for ${entityType}:${entityId} (${action})`);
+    return;
+  }
   setImmediate(async () => {
     try {
       // Resolve display name from DB (non-blocking, best-effort)
@@ -52,7 +60,7 @@ function logAudit({ entityType, entityId, action, changedBy, org_id, oldValues, 
         changed_by_name: changedByName,
         old_values:      oldValues  ? JSON.stringify(oldValues)  : null,
         new_values:      newValues  ? JSON.stringify(newValues)  : null,
-        org_id:          org_id         ?? 1,
+        org_id:          org_id,
         created_on:      db.fn.now(),
       });
     } catch (e) {

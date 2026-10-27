@@ -10,11 +10,13 @@
 
 const db     = require('../config/db');
 const logger = require('../logger');
+const { getOrgId } = require('../utils/orgScope');
 
 module.exports = function planGate(allowedPlans) {
   return async (req, res, next) => {
     try {
-      const orgId = req.login_data?.org_id ?? 1;
+      const orgId = getOrgId(req);
+      if (!orgId) return res.status(401).json({ error: 'Invalid token for this endpoint' });
 
       const sub = await db('edx_subscriptions as s')
         .join('edx_plans as p', 's.plan_id', 'p.id')

@@ -11,14 +11,39 @@
 const db     = require('../../config/db');
 const logger = require('../../logger');
 const applyBranchFilter = require('../../utils/applyBranchFilter');
+const { getOrgId } = require('../../utils/orgScope');
+const { guardOrgHandlers } = require('../../utils/requestOrg');
+const { getCurrentDateTime } = require('../../utils/dateTime');
 
-// In-memory schedule config (MVP — no DB table needed)
-let _scheduleConfig = {
-  enabled:   false,
-  dayOfWeek: 1,       // 1 = Monday (cron standard)
-  hour:      8,
-  emails:    [],
-};
+// Schedule config is persisted per org in edx_report_schedules (migration 031),
+// so it survives restarts and the weekly cron can serve every org.
+const DEFAULT_SCHEDULE = Object.freeze({ enabled: false, dayOfWeek: 1, hour: 8, emails: [] });
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function parseRecipients(raw) {
+  if (!raw) return [];
+  try {
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list.filter((e) => typeof e === 'string' && EMAIL_RE.test(e)) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function rowToConfig(row) {
+  if (!row) return { ...DEFAULT_SCHEDULE };
+  return {
+    enabled:   Boolean(Number(row.enabled)),
+    dayOfWeek: Number(row.day_of_week),
+    hour:      Number(row.hour),
+    emails:    parseRecipients(row.recipients),
+  };
+}
+
+async function getScheduleConfig(orgId) {
+  const row = await db('edx_report_schedules').where({ org_id: orgId }).first();
+  return rowToConfig(row);
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -49,7 +74,7 @@ function toCsv(rows) {
 
 // ── Report queries ────────────────────────────────────────────────────────────
 
-async function queryBookings(user, { from, to, branch_id }) {
+async function queryBookings(user, orgId, { from, to, branch_id }) {
   let q = db('edx_bookings as b')
     .leftJoin('edx_patient as p',           'b.patient_id',    'p.id')
     .leftJoin('edx_branches as br',          'b.branch_id',    'br.br_id')
@@ -66,14 +91,14 @@ async function queryBookings(user, { from, to, branch_id }) {
       'b.created_on',
     )
     .orderBy('b.id', 'desc');
-  q = q.where('b.org_id', user.org_id ?? 1);
+  q = q.where('b.org_id', orgId);
   q = applyBranchFilter(q, user, 'b.branch_id');
   if (branch_id) q = q.where('b.branch_id', branch_id);
   q = applyDateRange(q, from, to, 'b.created_on');
   return q.limit(1000);
 }
 
-async function queryRevenue(user, { from, to, branch_id }) {
+async function queryRevenue(user, orgId, { from, to, branch_id }) {
   let q = db('edx_invoice as inv')
     .join('edx_bookings as b', 'inv.booking_id', 'b.id')
     .leftJoin('edx_branches as br', 'b.branch_id', 'br.br_id')
@@ -86,45 +111,46 @@ async function queryRevenue(user, { from, to, branch_id }) {
     )
     .groupByRaw('YEAR(inv.created_on), MONTH(inv.created_on), br.br_id, br.br_name')
     .orderByRaw('year DESC, month DESC');
-  q = q.where('b.org_id', user.org_id ?? 1);
+  q = q.where('b.org_id', orgId);
   q = applyBranchFilter(q, user, 'b.branch_id');
   if (branch_id) q = q.where('b.branch_id', branch_id);
   q = applyDateRange(q, from, to, 'inv.created_on');
   return q.limit(500);
 }
 
-async function queryHpUtilization(user, { from, to, branch_id }) {
+async function queryHpUtilization(user, orgId, { from, to, branch_id }) {
   let q = db('edx_booking_hp as bh')
-    .join('edx_bookings as b',         'bh.booking_id',   'b.id')
+    .join('edx_bookings as b',         'bh.bkng_id',      'b.id')
     .join('edx_hp_registration as hp', 'bh.hp_unique_id', 'hp.hp_reg_id')
     .leftJoin('edx_branches as br',    'hp.hp_reg_branch_id', 'br.br_id')
     .select(
       'hp.hp_reg_id',
       db.raw("CONCAT(COALESCE(hp.hp_reg_first_name,''), ' ', COALESCE(hp.hp_reg_last_name,'')) as hp_name"),
       'br.br_name  as branch',
-      db.raw('COUNT(DISTINCT bh.booking_id)  as total_bookings'),
+      db.raw('COUNT(DISTINCT bh.bkng_id)     as total_bookings'),
       db.raw('MIN(b.service_start_date)      as first_booking'),
       db.raw('MAX(b.service_end_date)        as last_booking'),
     )
     .groupBy('bh.hp_unique_id', 'hp.hp_reg_id', 'hp.hp_reg_first_name',
              'hp.hp_reg_last_name', 'br.br_name')
     .orderBy('total_bookings', 'desc');
-  q = q.where('b.org_id', user.org_id ?? 1);
+  q = q.where('b.org_id', orgId).where('bh.org_id', orgId);
   q = applyBranchFilter(q, user, 'b.branch_id');
   if (branch_id) q = q.where('b.branch_id', branch_id);
   q = applyDateRange(q, from, to, 'b.created_on');
   return q.limit(500);
 }
 
-async function queryOutstanding(user, { from, to, branch_id }) {
+async function queryOutstanding(user, orgId, { from, to, branch_id }) {
   let q = db('edx_invoice as inv')
     .join('edx_bookings as b', 'inv.booking_id', 'b.id')
     .leftJoin('edx_branches as br', 'b.branch_id', 'br.br_id')
     .leftJoin(
-      db('edx_receipt')
+      db('edx_receipts')
         .select('booking_id')
-        .sum('receipt_amount as collected')
-        .where('receipt_status', 'Approved')
+        .sum('total_amount as collected')
+        .where('status', 'Approved')
+        .where('org_id', orgId)
         .groupBy('booking_id')
         .as('rec'),
       'rec.booking_id', 'b.id'
@@ -139,7 +165,7 @@ async function queryOutstanding(user, { from, to, branch_id }) {
     .groupBy('b.id', 'br.br_name', 'rec.collected')
     .havingRaw('outstanding > 0')
     .orderBy('outstanding', 'desc');
-  q = q.where('b.org_id', user.org_id ?? 1);
+  q = q.where('b.org_id', orgId);
   q = applyBranchFilter(q, user, 'b.branch_id');
   if (branch_id) q = q.where('b.branch_id', branch_id);
   q = applyDateRange(q, from, to, 'inv.created_on');
@@ -151,15 +177,16 @@ async function queryOutstanding(user, { from, to, branch_id }) {
 const generateReport = async (req, res) => {
   try {
     const user      = req.login_data;
+    const orgId     = getOrgId(req);
     const { type = 'bookings', from, to, format = 'json' } = req.query;
     const branch_id = req.query.branch_id ? parseInt(req.query.branch_id) : null;
 
     let rows;
     switch (type) {
-      case 'bookings':        rows = await queryBookings(user,       { from, to, branch_id }); break;
-      case 'revenue':         rows = await queryRevenue(user,        { from, to, branch_id }); break;
-      case 'hp_utilization':  rows = await queryHpUtilization(user,  { from, to, branch_id }); break;
-      case 'outstanding':     rows = await queryOutstanding(user,     { from, to, branch_id }); break;
+      case 'bookings':        rows = await queryBookings(user, orgId, { from, to, branch_id }); break;
+      case 'revenue':         rows = await queryRevenue(user, orgId, { from, to, branch_id }); break;
+      case 'hp_utilization':  rows = await queryHpUtilization(user, orgId, { from, to, branch_id }); break;
+      case 'outstanding':     rows = await queryOutstanding(user, orgId, { from, to, branch_id }); break;
       default:
         return res.status(400).json({ message: `Unknown report type: ${type}` });
     }
@@ -173,32 +200,73 @@ const generateReport = async (req, res) => {
 
     res.json({ type, from, to, count: rows.length, data: rows });
   } catch (error) {
-    logger.error('[reportsController] generateReport error:', error);
-    res.status(500).json({ message: 'Failed to generate report.', details: error.message });
+    logger.error(`[reportsController] generateReport error: ${error.message}`);
+    res.status(500).json({ message: 'Failed to generate report.' });
   }
 };
 
 const configureReportSchedule = async (req, res) => {
   try {
-    const { enabled, dayOfWeek, hour, emails } = req.body;
-    if (enabled  !== undefined) _scheduleConfig.enabled   = Boolean(enabled);
-    if (dayOfWeek !== undefined) _scheduleConfig.dayOfWeek = parseInt(dayOfWeek);
-    if (hour      !== undefined) _scheduleConfig.hour      = parseInt(hour);
-    if (emails    !== undefined) _scheduleConfig.emails    = emails;
-    res.json({ message: 'Schedule updated.', config: _scheduleConfig });
+    const orgId = getOrgId(req);
+    const current = await getScheduleConfig(orgId);
+    const { enabled, dayOfWeek, hour, emails } = req.body || {};
+
+    const next = { ...current };
+    if (enabled !== undefined) next.enabled = enabled === true || enabled === 'true' || enabled === 1 || enabled === '1';
+    if (dayOfWeek !== undefined) {
+      const d = parseInt(dayOfWeek, 10);
+      if (!(d >= 0 && d <= 6)) return res.status(400).json({ message: 'dayOfWeek must be 0 (Sun) to 6 (Sat).' });
+      next.dayOfWeek = d;
+    }
+    if (hour !== undefined) {
+      const h = parseInt(hour, 10);
+      if (!(h >= 0 && h <= 23)) return res.status(400).json({ message: 'hour must be 0 to 23.' });
+      next.hour = h;
+    }
+    if (emails !== undefined) {
+      const list = Array.isArray(emails) ? emails : String(emails || '').split(',');
+      const cleaned = [...new Set(list.map((e) => String(e).trim()).filter(Boolean))];
+      const invalid = cleaned.filter((e) => !EMAIL_RE.test(e));
+      if (invalid.length) return res.status(400).json({ message: `Invalid email address: ${invalid[0]}` });
+      next.emails = cleaned.slice(0, 20);
+    }
+
+    const row = {
+      org_id:      orgId,
+      enabled:     next.enabled ? 1 : 0,
+      day_of_week: next.dayOfWeek,
+      hour:        next.hour,
+      recipients:  next.emails.length ? JSON.stringify(next.emails) : null,
+      updated_by:  req.login_data?.id ?? null,
+      updated_on:  getCurrentDateTime(),
+    };
+    await db('edx_report_schedules').insert(row).onConflict('org_id').merge({
+      enabled: row.enabled, day_of_week: row.day_of_week, hour: row.hour,
+      recipients: row.recipients, updated_by: row.updated_by, updated_on: row.updated_on,
+    });
+
+    res.json({ message: 'Schedule updated.', config: next });
   } catch (error) {
-    logger.error('[reportsController] configureReportSchedule error:', error);
+    logger.error(`[reportsController] configureReportSchedule error: ${error.message}`);
     res.status(500).json({ message: 'Failed to update schedule.' });
   }
 };
 
 const getScheduledReports = async (req, res) => {
-  res.json(_scheduleConfig);
+  try {
+    res.json(await getScheduleConfig(getOrgId(req)));
+  } catch (error) {
+    logger.error(`[reportsController] getScheduledReports error: ${error.message}`);
+    res.status(500).json({ message: 'Failed to fetch schedule.' });
+  }
 };
 
 module.exports = {
-  generateReport,
-  configureReportSchedule,
-  getScheduledReports,
-  getScheduleConfig: () => _scheduleConfig,
+  ...guardOrgHandlers({ generateReport, configureReportSchedule, getScheduledReports }),
+  // Used by cron/weeklyReport (no HTTP request; the org comes from the schedule row).
+  getScheduleConfig,
+  parseRecipients,
+  queryBookings,
+  queryRevenue,
+  toCsv,
 };

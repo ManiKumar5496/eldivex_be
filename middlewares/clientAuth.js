@@ -24,7 +24,11 @@ const clientAuth = (req, res, next) => {
     if (decoded.role !== 'client' || !decoded.user_id) {
       return res.status(403).json({ error: 'Not a client session' });
     }
-    req.client = { user_id: decoded.user_id, org_id: decoded.org_id ?? 1 };
+    // No org claim → no tenant scope; never fall back to a default org.
+    if (!decoded.org_id) {
+      return res.status(401).json({ error: 'Invalid token for this endpoint' });
+    }
+    req.client = { user_id: decoded.user_id, org_id: decoded.org_id };
     next();
   } catch (err) {
     return res.status(403).json({ error: 'Invalid or expired token' });

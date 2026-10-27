@@ -14,6 +14,7 @@ jest.mock('../../utils/orgScope',       () => ({
 }));
 jest.mock('../../utils/dateTime',       () => ({
   getCurrentDateTime: jest.fn().mockReturnValue('2026-05-25 10:00:00'),
+  mysqlDateAddDays:   jest.fn().mockReturnValue('2026-06-09'),
 }));
 jest.mock('../../logger', () => ({
   error: jest.fn(),
@@ -22,9 +23,16 @@ jest.mock('../../logger', () => ({
 }));
 jest.mock('../../models/web_app/bookingsModel');
 jest.mock('../../utils/emailTemplates', () => ({
-  bookingConfirmed: jest.fn().mockReturnValue({ subject: 'Booking', html: '' }),
-  otpDelivery:      jest.fn().mockReturnValue({ subject: 'OTP',     html: '' }),
-  invoiceGenerated: jest.fn().mockReturnValue({ subject: 'Invoice', html: '' }),
+  bookingConfirmed:    jest.fn().mockReturnValue({ subject: 'Booking', html: '' }),
+  otpDelivery:         jest.fn().mockReturnValue({ subject: 'OTP',     html: '' }),
+  invoiceGenerated:    jest.fn().mockReturnValue({ subject: 'Invoice', html: '' }),
+  invoiceEmail:        jest.fn().mockReturnValue({ subject: 'Invoice', html: '' }),
+  paymentReceiptEmail: jest.fn().mockReturnValue({ subject: 'Receipt', html: '' }),
+  creditNoteGenerated: jest.fn().mockReturnValue({ subject: 'Credit',  html: '' }),
+  cancellationBillingSummary: jest.fn().mockReturnValue({ subject: 'Cancel', html: '' }),
+}));
+jest.mock('../../utils/orgBrand', () => ({
+  getOrgBrand: jest.fn().mockResolvedValue({ name: 'Test Org' }),
 }));
 
 // ── Imports ───────────────────────────────────────────────────────────────────
@@ -76,6 +84,8 @@ function chain(value) {
     andWhere:   jest.fn().mockReturnThis(),
     whereIn:    jest.fn().mockReturnThis(),
     whereNotIn: jest.fn().mockReturnThis(),
+    whereBetween: jest.fn().mockReturnThis(),
+    count:      jest.fn().mockReturnThis(),
     leftJoin:   jest.fn().mockReturnThis(),
     join:       jest.fn().mockReturnThis(),
     select:     jest.fn().mockReturnThis(),
@@ -103,8 +113,19 @@ beforeEach(() => {
   const { withOrg, getOrgId } = require('../../utils/orgScope');
   withOrg.mockImplementation((req, data) => ({ ...data, org_id: 1 }));
   getOrgId.mockReturnValue(1);
+  const { mysqlDateAddDays, getCurrentDateTime } = require('../../utils/dateTime');
+  mysqlDateAddDays.mockReturnValue('2026-06-09');
+  getCurrentDateTime.mockReturnValue('2026-05-25 10:00:00');
+  const { getOrgBrand } = require('../../utils/orgBrand');
+  getOrgBrand.mockResolvedValue({ name: 'Test Org' });
   setupDbStatics();
 });
+
+// Ownership lookups (booking / client / branch / service / HP in the caller's
+// org) resolve to a found row unless a test overrides them.
+function ownedRowsByDefault() {
+  db.mockImplementation(() => chain({ id: 1, user_id: 3, br_id: 2, hp_reg_id: 7, final_rate: '100' }));
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // createBooking
@@ -130,6 +151,36 @@ describe('createBooking', () => {
     base_rate: 500, patient_name: 'Radha Devi',
   };
 
+  beforeEach(ownedRowsByDefault);
+
+  test('responds 404 when the branch belongs to another org', async () => {
+    setupTrx();
+    db.mockReturnValueOnce(chain({ id: 1 }))  // client found
+      .mockReturnValueOnce(chain(null));      // branch not in this org
+    const res = mockRes();
+    await createBooking(mockReq(validBody), res);
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(withTransaction).not.toHaveBeenCalled();
+  });
+
+  test('responds 403 PLAN_LIMIT when the monthly booking limit is reached', async () => {
+    process.env.ENFORCE_PLAN_LIMITS = 'true';
+    try {
+      setupTrx();
+      db.mockImplementation((table) => {
+        if (table === 'edx_subscriptions as s') return chain({ name: 'Starter', booking_limit: 2, hp_limit: 0 });
+        if (table === 'edx_bookings') return chain({ cnt: 2 });
+        return chain({ id: 1, br_id: 2 });
+      });
+      const res = mockRes();
+      await createBooking(mockReq(validBody), res);
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'PLAN_LIMIT' }));
+    } finally {
+      delete process.env.ENFORCE_PLAN_LIMITS;
+    }
+  });
+
   test('responds 201 with booking_id on success', async () => {
     setupTrx(10, 99);
     const res = mockRes();
@@ -154,6 +205,18 @@ describe('createBooking', () => {
     await createBooking(mockReq(validBody), res);
     expect(trx).toHaveBeenCalledWith('edx_patient');
     expect(trx).toHaveBeenCalledWith('edx_bookings');
+  });
+
+  test('persists patient_conditions_others, spl_care_requirements and placement_time', async () => {
+    const { insertMock } = setupTrx();
+    const res = mockRes();
+    await createBooking(mockReq({
+      ...validBody,
+      patient_conditions_others: 'Diabetic', spl_care_requirements: 'Night care', placement_time: '09:00',
+    }), res);
+    expect(insertMock.mock.calls[1][0]).toEqual(expect.objectContaining({
+      patient_conditions_others: 'Diabetic', spl_care_requirements: 'Night care', placement_time: '09:00',
+    }));
   });
 
   test('responds 500 when transaction throws', async () => {
@@ -184,8 +247,27 @@ describe('updatePatient', () => {
     badChain.update = jest.fn().mockRejectedValue(new Error('DB error'));
     db.mockReturnValueOnce(badChain);
     const res = mockRes();
-    await updatePatient(mockReq({ patient_id: 5 }), res);
+    await updatePatient(mockReq({ patient_id: 5, patient_name: 'X' }), res);
     expect(res.status).toHaveBeenCalledWith(500);
+  });
+
+  test('omitted and blank fields are not overwritten with NA', async () => {
+    const c = chain(1);
+    db.mockReturnValueOnce(c);
+    const res = mockRes();
+    await updatePatient(mockReq({ patient_id: 5, patient_name: 'New Name', email: '' }), res);
+    const payload = c.update.mock.calls[0][0];
+    expect(payload.patient_name).toBe('New Name');
+    expect(payload).not.toHaveProperty('email');
+    expect(payload).not.toHaveProperty('age');
+  });
+
+  test('responds 404 when the patient is not in the caller org', async () => {
+    const c = chain(0); c.update = jest.fn().mockResolvedValue(0);
+    db.mockReturnValueOnce(c);
+    const res = mockRes();
+    await updatePatient(mockReq({ patient_id: 5, patient_name: 'X' }), res);
+    expect(res.status).toHaveBeenCalledWith(404);
   });
 });
 
@@ -282,6 +364,16 @@ describe('updateHPBooking', () => {
     expect(updated_fields).toContain('status');
   });
 
+  test('status=3: OTP is a 6-digit string from crypto.randomInt', async () => {
+    const updateChain = chain(1);
+    db.mockReturnValueOnce(chain(existingHp));
+    db.mockReturnValueOnce(updateChain);
+    const res = mockRes();
+    await updateHPBooking(mockReq({ booking_id: 10, hp_unique_id: 7, status: 3 }), res);
+    const payload = updateChain.update.mock.calls[0][0];
+    expect(payload.otp).toMatch(/^\d{6}$/);
+  });
+
   test('status=1: sets hp_reg_status to 6', async () => {
     const updateMock = withHpRegUpdate(6);
     const res = mockRes();
@@ -335,6 +427,16 @@ describe('holdBooking', () => {
     withTransaction.mockImplementation(async (fn) => { await fn(trx); });
     return trx;
   }
+
+  beforeEach(ownedRowsByDefault);
+
+  test('responds 404 when the booking is not in the caller org', async () => {
+    db.mockReturnValueOnce(chain(null));
+    const res = mockRes();
+    await holdBooking(mockReq({ booking_id: 5, from_date: '2026-07-01', to_date: '2026-07-10' }), res);
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(withTransaction).not.toHaveBeenCalled();
+  });
 
   test('responds 201 on success', async () => {
     setupHoldTrx();
@@ -394,6 +496,17 @@ describe('assignHPToBooking', () => {
     const res = mockRes();
     await assignHPToBooking(mockReq({ booking_id: 10 }), res);
     expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  beforeEach(ownedRowsByDefault);
+
+  test('responds 404 when the HP is not in the caller org', async () => {
+    db.mockReturnValueOnce(chain({ id: 10 }))   // booking found
+      .mockReturnValueOnce(chain(null));        // HP not found
+    const res = mockRes();
+    await assignHPToBooking(mockReq({ booking_id: 10, hp_id: 7 }), res);
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(withTransaction).not.toHaveBeenCalled();
   });
 
   test('responds 201 on success', async () => {
@@ -527,6 +640,16 @@ describe('cancelUserService', () => {
     withTransaction.mockImplementation(async (fn) => { await fn(trx); });
     return trx;
   }
+
+  beforeEach(ownedRowsByDefault);
+
+  test('responds 404 when the booking is not in the caller org', async () => {
+    db.mockReturnValueOnce(chain(null));
+    const res = mockRes();
+    await cancelUserService(mockReq({ booking_id: 5 }), res);
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(withTransaction).not.toHaveBeenCalled();
+  });
 
   test('responds 201 on success', async () => {
     setupCancelTrx();
@@ -676,10 +799,11 @@ describe('finalBookingSave', () => {
       .mockResolvedValueOnce(bookingRow);
 
     const trxFn = jest.fn().mockReturnValue({
-      where:  jest.fn().mockReturnThis(),
-      update: jest.fn().mockResolvedValue(1),
-      insert: jest.fn().mockResolvedValue([55]),
-      first:  firstMock,
+      where:     jest.fn().mockReturnThis(),
+      forUpdate: jest.fn().mockReturnThis(),
+      update:    jest.fn().mockResolvedValue(1),
+      insert:    jest.fn().mockResolvedValue([55]),
+      first:     firstMock,
     });
     trxFn.commit   = jest.fn().mockResolvedValue(undefined);
     trxFn.rollback = jest.fn().mockResolvedValue(undefined);

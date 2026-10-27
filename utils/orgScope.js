@@ -10,8 +10,12 @@
 
 const db = require('../config/db');
 
+// Staff org from the verified JWT. Returns null for owner tokens and when the
+// claim is missing — never a default org. Callers treat null as 401.
 function getOrgId(req) {
-  return req.login_data?.org_id ?? 1;
+  const d = req.login_data;
+  if (!d || d.is_owner === true) return null;
+  return d.org_id ?? null;
 }
 
 function withOrg(req, data) {

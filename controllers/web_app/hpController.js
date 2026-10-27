@@ -9,6 +9,8 @@ const withTransaction = require('../../utils/withTransaction');
 const docUrl = process.env.DOC_FOLDER_URL;
 const { logAudit } = require('../../utils/auditLogger'); // Phase 4.2
 const { withOrg, orgQuery, getOrgId } = require('../../utils/orgScope'); // Phase 5
+const { checkPlanLimit } = require('../../utils/planUsage');
+const { guardOrgHandlers } = require('../../utils/requestOrg');
 
 const getHPDetails = async (req, res) =>  {
     try {
@@ -81,7 +83,10 @@ const createHPProfile = async (req, res) => {
       const userId = req.login_data?.id || null;
       // console.log(req.body)
       const files = req.files;
-      // console.log(files);
+
+      const limit = await checkPlanLimit(getOrgId(req), 'hp');
+      if (limit) return res.status(403).json(limit);
+
       let hp_reg_photo_name
       let hp_reg_identity_proof_front_image_name
       let hp_reg_identity_proof_back_image_name
@@ -178,7 +183,7 @@ const createHPProfile = async (req, res) => {
         entityId:   hp_reg_id,
         action:     'CREATE',
         changedBy:  userId,
-        org_id:     req.login_data?.org_id ?? 1,
+        org_id:     getOrgId(req),
         newValues:  { hp_reg_id, name: `${hp_reg_first_name} ${hp_reg_last_name}` },
       });
 
@@ -225,9 +230,10 @@ const createHPProfile = async (req, res) => {
       const userId = req.login_data?.id || null;
       const files = req.files;
       
-      // Fetch existing record to preserve current file names
+      // Fetch existing record to preserve current file names.
+      // Org-scoped so one org can never read/target another org's HP record.
       const existingRecord = await db('edx_hp_registration')
-        .where({ hp_reg_id: hp_reg_id })
+        .where({ hp_reg_id: hp_reg_id, org_id: getOrgId(req) })
         .first();
 
       if (!existingRecord) {
@@ -327,7 +333,7 @@ const createHPProfile = async (req, res) => {
         entityId:   hp_reg_id,
         action:     'UPDATE',
         changedBy:  userId,
-        org_id:     req.login_data?.org_id ?? 1,
+        org_id:     getOrgId(req),
         newValues:  { hp_reg_id, name: `${hp_reg_first_name} ${hp_reg_last_name}` },
       });
 
@@ -462,7 +468,7 @@ const getPayoutHistory = async (req, res) => {
   }
 };
 
-module.exports = {
+module.exports = guardOrgHandlers({
     createHPProfile,
     getHPDetails,
     updateHPProfile,
@@ -470,4 +476,4 @@ module.exports = {
     createPayout,
     markPayoutPaid,
     getPayoutHistory,
-  };
+  });

@@ -2,19 +2,20 @@ const db = require('../../config/db');
 
 async function getAddressModel (filters = {})
 {
-   const { user_id } = filters;
+   const { user_id, org_id } = filters;
 
- let query = db('edx_user_address')   
+ let query = db('edx_user_address')
    .select('*')
    .where('status','1');
     // console.log(query.toString());
     if (user_id) query.where('edx_user_address.user_id', user_id);
+    if (org_id) query.where('edx_user_address.org_id', org_id);
 
  return query;
 };
 
 async function getcouponsModel(filters = {}) {
-  const { coupon_id, coupon_name, checkDuplicate, org_id } = filters;
+  const { coupon_id, coupon_name, checkDuplicate, includeInactive, org_id } = filters;
 
   let query = db('edx_master_coupons')
     .select(
@@ -22,10 +23,13 @@ async function getcouponsModel(filters = {}) {
       'coupon_name',
       'discount_percentage',
       'discount_upper_limit_value'
-    )
-    .where('status', '1');
+    );
 
-  if (org_id) query = query.where('org_id', org_id);
+  // Duplicate checks must see inactive coupons too — the unique key does.
+  if (!includeInactive) query = query.where('status', '1');
+
+  // Always org-scoped: no org → no rows (never every tenant's coupons).
+  query = query.where('org_id', org_id ?? -1);
 
   // Filter by ID
   if (coupon_id) {

@@ -15,6 +15,7 @@
 
 const db = require('../../config/db');
 const bcrypt = require('bcrypt');
+const crypto = require('crypto');
 const logger = require('../../logger');
 const { generateHpToken } = require('../../utils/jwt');
 const { resolveOrgId } = require('../../utils/orgCode');
@@ -22,7 +23,10 @@ const { isOrgLoginBlocked, ORG_SUSPENDED_RESPONSE } = require('../../utils/orgSt
 const { getCurrentDateTime } = require('../../utils/dateTime');
 const { sendOTP } = require('../../utils/smsService');
 
-const isDev = process.env.NODE_ENV !== 'production';
+// Dev-only test aids (dev_otp in the response, HP_STATIC_OTP). Both flags
+// are required; envValidator refuses EXPOSE_DEV_OTP=true in production.
+const devOtpEnabled = () =>
+  process.env.NODE_ENV === 'development' && process.env.EXPOSE_DEV_OTP === 'true';
 
 // Statuses that may log in: 2=Approved, 5=ActiveBooking, 6=OTPBooking.
 const LOGIN_ALLOWED_STATUSES = [2, 5, 6];
@@ -113,8 +117,8 @@ const requestOtp = async (req, res) => {
     const hp = await findHpByPhone(orgId, phone10);
     if (!hp) return res.status(200).json(generic); // don't reveal existence
 
-    // 6-digit OTP. crypto-random is unavailable to non-prod debugging only.
-    const otp = String(Math.floor(100000 + Math.random() * 900000));
+    // 6-digit, crypto-random OTP.
+    const otp = String(crypto.randomInt(100000, 1000000));
     const otpHash = await bcrypt.hash(otp, 10);
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
 
@@ -133,8 +137,8 @@ const requestOtp = async (req, res) => {
     try { await sendOTP(phone10, otp); }
     catch (smsErr) { logger.warn(`[hpAuth] OTP SMS failed for ${phone10}: ${smsErr.message}`); }
 
-    // In non-prod, surface the OTP so the portal can be tested without SMS.
-    return res.status(200).json(isDev ? { ...generic, dev_otp: otp } : generic);
+    // Dev only: surface the OTP so the portal can be tested without SMS.
+    return res.status(200).json(devOtpEnabled() ? { ...generic, dev_otp: otp } : generic);
   } catch (err) {
     logger.error(`Error requestOtp: ${err.message}`);
     return res.status(500).json({ message: 'Could not send OTP. Please try again.' });
@@ -156,11 +160,9 @@ const verifyOtp = async (req, res) => {
 
     if (await isOrgBlocked(orgId)) return res.status(403).json(ORG_SUSPENDED_RESPONSE);
 
-    // ── TEMPORARY (testing): accept a static OTP so the portal can be used
-    // before SMS delivery is wired up. The HP must still exist and be active in
-    // this org. Set HP_STATIC_OTP='' (empty) in env to disable and enforce real
-    // OTPs. Remove this block when going live. ─────────────────────────────────
-    const STATIC_OTP = process.env.HP_STATIC_OTP ?? '123456';
+    // ── Static OTP: dev only (NODE_ENV=development AND EXPOSE_DEV_OTP=true AND
+    // HP_STATIC_OTP set). Never active anywhere else. ─────────────────────────
+    const STATIC_OTP = devOtpEnabled() ? process.env.HP_STATIC_OTP : undefined;
     if (STATIC_OTP && otp === STATIC_OTP) {
       const hp = await findHpByPhone(orgId, phone10);
       if (!hp) return res.status(403).json({ message: 'Your account is not active. Please contact support.' });

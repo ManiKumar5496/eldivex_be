@@ -5,21 +5,79 @@ const folderMapper = require("../../utils/folderMapper");
 require('dotenv').config();
 const uploadHandler=require('../../middlewares/uploadHandler')
 const { generateToken } = require('../../utils/jwt');
-const jwt = require('jsonwebtoken');
+const { invalidateStaffCache } = require('../../middlewares/auth');
 const bcrypt = require('bcrypt');
 const crypto = require('crypto');
 const { getCurrentDateTime } = require("../../utils/dateTime");
 const { sendEmail } = require('../../utils/emailService');
 const { passwordResetLink } = require('../../utils/emailTemplates');
 const { withOrg, getOrgId } = require('../../utils/orgScope');
-const { resolveOrgId } = require('../../utils/orgCode');
 const { isOrgLoginBlocked, ORG_SUSPENDED_RESPONSE } = require('../../utils/orgStatus');
+const { getAcceptanceStatus } = require('./termsController');
 
+/**
+ * Authorisation guard for assigning a web role to a user.
+ *
+ * Prevents privilege escalation: a caller may only assign a role that (a) belongs
+ * to the caller's own organisation and (b) grants a subset of the module access
+ * the caller's own role already has. An org's Super Admin (all modules) can assign
+ * any role in the org; a limited user can never grant a broader role than their own.
+ *
+ * Returns null when allowed, or an error string describing the rejection.
+ */
+const parseAccessSet = (accessList) =>
+  new Set(String(accessList || '').split(',').map((s) => s.trim()).filter(Boolean));
+
+async function checkRoleAssignment(req, targetRoleId) {
+  // No role provided → nothing to escalate (user gets no module access).
+  if (!targetRoleId || targetRoleId === 'NA') return null;
+
+  const orgId = getOrgId(req);
+  const callerRoleId = req.login_data?.role_id;
+
+  const targetRole = await db('edx_web_emp_roles')
+    .where({ id: targetRoleId, org_id: orgId })
+    .first('id', 'access_list');
+  if (!targetRole) return 'Invalid role for this organisation.';
+
+  const callerRole = await db('edx_web_emp_roles')
+    .where({ id: callerRoleId, org_id: orgId })
+    .first('id', 'access_list');
+  if (!callerRole) return 'You are not permitted to assign roles.';
+
+  const callerAccess = parseAccessSet(callerRole.access_list);
+  const targetAccess = parseAccessSet(targetRole.access_list);
+  for (const mod of targetAccess) {
+    if (!callerAccess.has(mod)) {
+      return 'You cannot assign a role with more access than your own.';
+    }
+  }
+  return null;
+}
+
+
+/**
+ * Invalidates every JWT issued to a staff user before now (auth rejects tokens
+ * with iat < tokens_valid_after). Second precision, truncated, so a token
+ * issued right after this call is still accepted. Tolerates the column being
+ * absent until migration 20261007_041 has run.
+ */
+async function revokeSessions(userId) {
+  const now = new Date(Math.floor(Date.now() / 1000) * 1000);
+  try {
+    await db('edx_web_app_users').where({ id: userId }).update({ tokens_valid_after: now });
+  } catch (err) {
+    if (err.code !== 'ER_BAD_FIELD_ERROR') throw err;
+    logger.warn('[userController] tokens_valid_after missing — run migration 20261007_041');
+  }
+  invalidateStaffCache(userId);
+}
 
 const getUserDetails = async (req, res) =>  {
   try {
-    const filters = req.query;
-    // console.log(filters)
+    // org_id comes from the authenticated token, never the client query string,
+    // so a forged ?org_id= cannot pull another tenant's users.
+    const filters = { ...req.query, org_id: getOrgId(req) };
     const getDetails = await getUsers.getDetails(filters);
 
     res.json(getDetails);
@@ -31,8 +89,9 @@ const getUserDetails = async (req, res) =>  {
 };
 const getWebEmpDetails = async (req, res) =>  {
   try {
-    const filters = req.query;
-    // console.log(filters)
+    // org_id comes from the authenticated token, never the client query string,
+    // so a forged ?org_id= cannot pull another tenant's employees.
+    const filters = { ...req.query, org_id: getOrgId(req) };
     const getData = await getUsers.getWebEmpDetailsModel(filters);
   
     const docUrl = process.env.DOC_FOLDER_URL
@@ -62,11 +121,8 @@ const saveUser = async (req, res) => {
   try {
     const {
       id,
-      device_id,
-      user_token,
       phone_number,
       status,
-      created_by,
       user_name,
       user_location,
       user_email,
@@ -80,12 +136,11 @@ const saveUser = async (req, res) => {
     } = req.body;
 
     const files = req.files;
-    const userId = req.login_data?.id || null;
     const is_new_user_flag=0;
 
-    // 1️⃣ Fetch existing user
+    // 1️⃣ Fetch existing user (org-scoped — cannot touch another org's client)
     const existingUser = await db('edx_client_app_users')
-      .where({ id })
+      .where({ id, org_id: getOrgId(req) })
       .first();
 
     if (!existingUser) {
@@ -112,11 +167,8 @@ const saveUser = async (req, res) => {
     const updatePayload = {};
 
     const fields = {
-      device_id,
-      user_token,
       phone_number,
       status,
-      created_by,
       user_name,
       user_location,
       user_email,
@@ -141,14 +193,14 @@ const saveUser = async (req, res) => {
       updatePayload.user_image = user_image_name;
     }
 
-    // audit fields
-    updatePayload.updated_by = userId;
+    // audit field — edx_client_app_users has no updated_by/created_by columns,
+    // so only the timestamp is recorded here.
     updatePayload.updated_on = getCurrentDateTime();
 
-    // 4️⃣ Update DB
+    // 4️⃣ Update DB (org-scoped)
     if (Object.keys(updatePayload).length > 0) {
       await db('edx_client_app_users')
-        .where({ id })
+        .where({ id, org_id: getOrgId(req) })
         .update(updatePayload);
     }
 
@@ -165,58 +217,50 @@ const saveUser = async (req, res) => {
 };
 
 
-const loginUsers = async (req, res) => {
-  const { phone_number, org_id } = req.body;
+/**
+ * POST /api/login — RETIRED. It issued an admin-capable JWT for any
+ * {phone_number, org_id} with no OTP. Clients now use /clientAuth OTP login;
+ * staff create clients with /createClientUser.
+ */
+const loginUsers = async (req, res) =>
+  res.status(410).json({
+    message: 'This login is no longer supported. Use /clientAuth/requestOtp and /clientAuth/verifyOtp.',
+  });
 
-  if (!phone_number) return res.status(400).json({ message: "Phone number is required" });
-  if (!org_id) return res.status(400).json({ message: "Organization ID is required" });
-
-  // Numeric id (legacy orgs) or org code like SUN-482913 (new orgs).
-  const parsedOrgId = await resolveOrgId(db, org_id);
-  if (!parsedOrgId) return res.status(400).json({ message: "Invalid Organization ID" });
-
+/**
+ * POST /api/createClientUser — staff (Users or Bookings module) create or find
+ * a client by phone in their own org. org_id comes from the JWT only. Issues
+ * no token and never touches user_token.
+ */
+const createClientUser = async (req, res) => {
   try {
-    // 1. Validate org exists and is active
-    const org = await db('edx_organizations')
-      .select('id', 'name', 'status')
-      .where({ id: parsedOrgId })
-      .first();
+    const orgId = getOrgId(req);
+    if (!orgId) return res.status(401).json({ error: 'Invalid token for this endpoint' });
 
-    if (!org) return res.status(404).json({ message: "Organization not found" });
-    if (isOrgLoginBlocked(org.status)) {
-      return res.status(403).json(ORG_SUSPENDED_RESPONSE);
+    const cc = String(req.body.country_code || '').replace(/[^\d+]/g, '');
+    const digits = String(req.body.phone_number || '').replace(/\D/g, '');
+    if (digits.length < 10 || digits.length > 15) {
+      return res.status(400).json({ message: 'A valid phone number is required.' });
     }
+    const phone_number = cc && !digits.startsWith(cc.replace('+', '')) ? `${cc}${digits}` : digits;
 
-    // 2. Find or create client user scoped to this org
-    const result = await getUsers.upsertUserToken(phone_number, parsedOrgId);
-
-    // 3. Generate JWT with the real user id and org scope
-    const token = generateToken({
-      id: result.userId,
-      user_role: null,
-      user_branch_access: null,
-      org_id: parsedOrgId,
-    });
-
-    // 4. Persist the token on the user record
-    await db('edx_client_app_users')
-      .where({ id: result.userId })
-      .update({ user_token: token, updated_on: db.fn.now() });
-
+    const result = await getUsers.upsertUserToken(phone_number, orgId);
     return res.status(200).json({
-      message: "Login successful",
-      token,
-      isNewUser: result.isNewUser,
+      message: result.isNewUser ? 'Client created successfully.' : 'Client already exists.',
       userId: result.userId,
-      org_id: parsedOrgId,
-      phone_number,
+      isNewUser: result.isNewUser,
+      org_id: orgId,
     });
-
   } catch (err) {
-    console.error("❌ Error:", err.message);
-    return res.status(500).json({ error: err.message });
+    logger.error(`Error createClientUser: ${err.message}`);
+    if (err.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ message: 'This phone number is already registered.' });
+    }
+    return res.status(500).json({ message: 'Could not create client.' });
   }
 };
+
+const DUMMY_HASH = '$2b$10$CwTycUXWue0Thq9StjUM0uJ8.Zu3Y5lV5Ep5Sx5bSxp4Wv1vZ3Z1e';
 
 const loginWebUsers = async (req, res) => {
 
@@ -225,13 +269,25 @@ const loginWebUsers = async (req, res) => {
 
   // console.log(email)
   try {
+      // Unknown email and wrong password get the same 401 (no enumeration).
+      const INVALID = { message: 'Invalid email or password' };
+      if (!password) {
+          return res.status(400).json({ message: 'Password is required' });
+      }
       const [users] = await getUsers.loginUserWeb(email);
-      if (!users) return res.status(404).json({ message: 'User not found' });
+      // Compare against a dummy hash for unknown users so response timing
+      // doesn't reveal which emails exist.
+      const match = await bcrypt.compare(password, users?.user_password || DUMMY_HASH);
+      if (!users || !users.user_password || !match) return res.status(401).json(INVALID);
+
       const role_id=users.user_role
       const userId=users.id
       const user_name=users.user_name
       const branch_access = users.user_branch_access
-      const org_id = users.org_id ?? 1
+      const org_id = users.org_id
+      if (!org_id || role_id === null || role_id === undefined) {
+          return res.status(403).json({ message: 'Your account has no organisation or role assigned. Contact your administrator.' });
+      }
 
       // Org kill-switch: no user of a suspended/cancelled org can log in.
       // No role exemption — the platform owner has a separate /ownerLogin and
@@ -249,28 +305,25 @@ const loginWebUsers = async (req, res) => {
 
     const  user_image= users.user_image ? `${docUrl}/${folderName}/${users.user_image}` : null
     
-      // console.log(users)
-      // If password is provided, verify it
-      if (password) {
-          if (!users.user_password) {
-              return res.status(400).json({ message: 'Password login not enabled for this user' });
-          }
-
-          const match = await bcrypt.compare(password, users.user_password);
-          // console.log(match)
-          if (!match) return res.status(401).json({ message: 'Invalid password' });
-      }
-
-      // If password is not provided, allow password-less login
-      // (you can add extra validation like OTP here)
       const token = generateToken(users);
+
+      // Terms & Conditions gate: tell the web app whether this user must review
+      // and accept the current terms before entering the dashboard.
+      const terms = await getAcceptanceStatus(userId);
+
       // console.log(token)
-      return res.status(200).json({ message: 'Login successful', token, role_id, userId, user_name, user_image, branch_access, org_id, org_code: org?.org_code ?? null });
+      return res.status(200).json({
+        message: 'Login successful',
+        token, role_id, userId, user_name, user_image, branch_access, org_id,
+        org_code: org?.org_code ?? null,
+        terms_accepted: terms.accepted,
+        terms_version:  terms.version,
+      });
 
   } catch (err) {
     console.error('❌ Controller error:', err.message);
     logger.error(`Error login: ${err.message}`);
-      res.status(500).json({ error: err });
+      res.status(500).json({ message: 'Login failed. Please try again.' });
 
   }
   
@@ -292,9 +345,13 @@ const createUserWeb = async (req, res) => {
     const files = req.files;
     // console.log(files);
     let user_image_name
-  
+
+    // Authorisation: prevent assigning a role more privileged than the caller's.
+    const roleErr = await checkRoleAssignment(req, user_role);
+    if (roleErr) return res.status(403).json({ message: roleErr });
+
    const username = user_name.replace(/\s+/g, '_').replace(/[^\w\-]/g, '');
-  
+
     // Hash the password
     const hashedPassword = await bcrypt.hash(user_password, 10);
 
@@ -320,7 +377,7 @@ const createUserWeb = async (req, res) => {
       user_home_branch:user_home_branch?user_home_branch:'NA',
       user_branch_access:user_branch_access?user_branch_access:'NA',
       user_image: user_image_name,
-      created_by:userId,
+      created_by:req.login_data?.id ?? null,
       created_on:getCurrentDateTime()
     }));
 
@@ -331,7 +388,7 @@ const createUserWeb = async (req, res) => {
     if (err.code === 'ER_DUP_ENTRY') {
       return res.status(409).json({ message: 'Email already exists.' });
     }
-    res.status(500).json({ message: err.message || 'Server error.' });
+    res.status(500).json({ message: 'Server error.' });
   }
 };
 const updateUserWeb = async (req, res) => {
@@ -351,10 +408,14 @@ const updateUserWeb = async (req, res) => {
     // console.log(req.body)
     const files = req.files;
     let user_image_name
-    
+
+    // Authorisation: prevent escalating a user to a role beyond the caller's own.
+    const roleErr = await checkRoleAssignment(req, user_role);
+    if (roleErr) return res.status(403).json({ message: roleErr });
+
    const username = user_name.replace(/\s+/g, '_').replace(/[^\w\-]/g, '');
-  
-   
+
+
 // console.log(files)
    if(files && files['user_image'] && files['user_image'][0])
    {
@@ -366,7 +427,7 @@ const updateUserWeb = async (req, res) => {
 
   
     // update into DB
-     await db('edx_web_app_users')
+     const updated = await db('edx_web_app_users')
      .where({ id: id })
      .andWhere('org_id', getOrgId(req))
     .update({
@@ -379,16 +440,17 @@ const updateUserWeb = async (req, res) => {
       user_home_branch:user_home_branch?user_home_branch:'NA',
       user_branch_access:user_branch_access?user_branch_access:'NA',
       user_image: user_image_name,
-      updated_by:userId,
+      updated_by:req.login_data?.id ?? null,
       updated_on:getCurrentDateTime()
 
     });
 
+    if (!updated) return res.status(404).json({ message: 'User not found.' });
     res.status(201).json({ message: 'User updated successfully.' });
   } catch (err) {
     logger.error(`Error updating user: ${err.message}`);
     console.error(err);
-    res.status(500).json({ message: err.message || 'Server error.' });
+    res.status(500).json({ message: 'Server error.' });
   }
 };
 const terminateUserWeb = async (req, res) => {
@@ -402,6 +464,9 @@ const terminateUserWeb = async (req, res) => {
       .update({ user_status: 0, updated_on: getCurrentDateTime() });
 
     if (!updated) return res.status(404).json({ message: 'User not found.' });
+
+    // Revoke live sessions now, not when their 30-day JWT expires.
+    await revokeSessions(id);
 
     res.status(200).json({ message: 'User terminated successfully.' });
   } catch (err) {
@@ -569,6 +634,9 @@ const resetPassword = async (req, res) => {
         updated_on:             getCurrentDateTime(),
       });
 
+    // A password reset signs out every existing session of this user.
+    await revokeSessions(user.id);
+
     return res.status(200).json({ message: 'Password reset successful. You can now log in.' });
   } catch (err) {
     logger.error(`Error in resetPassword: ${err.message}`);
@@ -578,6 +646,7 @@ const resetPassword = async (req, res) => {
 
 module.exports = {
     loginUsers,
+    createClientUser,
     saveUser,
     getUserDetails,
     loginWebUsers,

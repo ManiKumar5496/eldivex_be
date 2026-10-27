@@ -4,7 +4,7 @@ const db = require('../../config/db');
 async function getAllHPDetails (filters = {}, login_data)
 {
    const { hp_reg_id } = filters;
-   const orgId = login_data?.org_id ?? 1;
+   const orgId = login_data && login_data.is_owner !== true ? login_data.org_id ?? -1 : -1;
 
  let query = db('edx_hp_registration')
    .select('edx_hp_rate.livein_pay',

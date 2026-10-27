@@ -5,10 +5,17 @@ require('dotenv').config();
 const { getCurrentDateTime, mysqlDateAddDays } = require("../../utils/dateTime");
 const withTransaction = require('../../utils/withTransaction');
 const { sendEmail } = require('../../utils/emailService');
-const { bookingConfirmed, otpDelivery, invoiceGenerated, creditNoteGenerated, cancellationBillingSummary } = require('../../utils/emailTemplates');
+const { bookingConfirmed, otpDelivery, invoiceEmail, creditNoteGenerated, cancellationBillingSummary } = require('../../utils/emailTemplates');
+const { getOrgBrand } = require('../../utils/orgBrand');
 const { sendOTP } = require('../../utils/smsService');
 const { logAudit } = require('../../utils/auditLogger'); // Phase 4.2
 const { withOrg, orgQuery, getOrgId } = require('../../utils/orgScope'); // Phase 5
+const { notifyOrgAdmins } = require('../../utils/notify');
+const { getClientContact } = require('../../utils/clientContact');
+const { checkPlanLimit } = require('../../utils/planUsage');
+const { ENGAGED_BOOKING_STATUSES } = require('../../utils/bookingStatus');
+const { guardOrgHandlers } = require('../../utils/requestOrg');
+const crypto = require('crypto');
 
 // ── Accounts event helpers ────────────────────────────────────────────────────
 
@@ -18,7 +25,8 @@ const { withOrg, orgQuery, getOrgId } = require('../../utils/orgScope'); // Phas
  */
 async function _createHoldCreditNote({ booking_id, from_date, to_date, inv_id, org_id, created_by }) {
   try {
-    const booking = await db('edx_bookings').where({ id: booking_id }).first();
+    if (org_id == null) return;
+    const booking = await db('edx_bookings').where({ id: booking_id, org_id }).first();
     if (!booking) return;
 
     const finalRate = parseFloat(booking.final_rate) || 0;
@@ -55,9 +63,10 @@ async function _createHoldCreditNote({ booking_id, from_date, to_date, inv_id, o
  * Compute cancellation billing summary for a booking.
  * Returns { days_used, amount_due, total_paid, balance, refundable, owing }
  */
-async function _computeCancellationBilling({ booking_id, cancel_date }) {
+async function _computeCancellationBilling({ booking_id, cancel_date, org_id }) {
   try {
-    const booking = await db('edx_bookings').where({ id: booking_id }).first();
+    if (org_id == null) return null;
+    const booking = await db('edx_bookings').where({ id: booking_id, org_id }).first();
     if (!booking) return null;
 
     const startDate  = booking.service_start_date;
@@ -79,10 +88,10 @@ async function _computeCancellationBilling({ booking_id, cancel_date }) {
     const amountDue = daysUsed * finalRate;
 
     const paidRow = await db('edx_receipts')
-      .where({ booking_id, status: 'Approved' })
+      .where({ booking_id, org_id, status: 'Approved' })
       .sum('total_amount as total_paid')
       .first();
-    const totalPaid = Number(paidRow.total_paid) || 0;
+    const totalPaid = Number(paidRow?.total_paid) || 0;
 
     const balance    = amountDue - totalPaid;
     const refundable = balance < 0 ? Math.abs(balance) : 0;
@@ -98,6 +107,33 @@ async function _computeCancellationBilling({ booking_id, cancel_date }) {
 /**
  * Log a rate change to edx_rate_history when booking rates are updated.
  */
+/**
+ * Returns the label of the first referenced record that does not exist in
+ * `orgId` (and, for the address, does not belong to the client), or null when
+ * every supplied id is valid. Empty / 'NA' ids are skipped.
+ */
+async function _findForeignBookingRefs(orgId, { user_id, address_id, branch_id, service_type_id }) {
+  const has = (v) => v !== undefined && v !== null && v !== '' && v !== 'NA';
+  if (has(user_id)) {
+    const client = await db('edx_client_app_users').where({ id: user_id, org_id: orgId }).first('id');
+    if (!client) return 'Client';
+  }
+  if (has(address_id)) {
+    const q = db('edx_user_address').where({ id: address_id, org_id: orgId });
+    if (has(user_id)) q.where('user_id', user_id);
+    if (!(await q.first('id'))) return 'Address';
+  }
+  if (has(branch_id)) {
+    const branch = await db('edx_branches').where({ br_id: branch_id, org_id: orgId }).first('br_id');
+    if (!branch) return 'Branch';
+  }
+  if (has(service_type_id)) {
+    const service = await db('edx_master_services').where({ id: service_type_id, org_id: orgId }).first('id');
+    if (!service) return 'Service';
+  }
+  return null;
+}
+
 async function _logRateChange({ booking_id, old_rate, new_rate, effective_date, changed_by, org_id, reason }) {
   try {
     if (old_rate === new_rate) return;
@@ -141,8 +177,9 @@ const createBooking = async (req, res) => {
         service_type_id,
         base_rate,
         base_discount_percentage,
-      
-        
+        patient_conditions_others,
+        spl_care_requirements,
+        placement_time,
       } = req.body;
       const userId = req.login_data.id;
 
@@ -155,6 +192,15 @@ const createBooking = async (req, res) => {
           message: 'A valid base_rate (greater than 0) is required to create a booking.',
         });
       }
+
+      // Every referenced id must belong to the caller's org (and the address to
+      // the client) — otherwise a booking could point at another tenant's data.
+      const orgId = getOrgId(req);
+      const notFound = await _findForeignBookingRefs(orgId, { user_id, address_id, branch_id, service_type_id });
+      if (notFound) return res.status(404).json({ message: `${notFound} not found.` });
+
+      const limit = await checkPlanLimit(orgId, 'booking');
+      if (limit) return res.status(403).json(limit);
 
       let booking_id;
       await withTransaction(async (trx) => {
@@ -186,6 +232,9 @@ const createBooking = async (req, res) => {
           address_id: address_id || 'NA',
           base_rate: parsedBaseRate,
           base_discount_percentage: base_discount_percentage ?? null,
+          patient_conditions_others: patient_conditions_others || null,
+          spl_care_requirements: spl_care_requirements || null,
+          placement_time: placement_time || null,
           created_by: userId,
           created_on: getCurrentDateTime()
         }));
@@ -199,27 +248,31 @@ const createBooking = async (req, res) => {
         entityId:   booking_id,
         action:     'CREATE',
         changedBy:  userId,
-        org_id:     req.login_data?.org_id ?? 1,
+        org_id:     orgId,
         newValues:  { booking_id, branch_id, service_type_id, user_id },
+      });
+
+      notifyOrgAdmins(orgId, {
+        type:  'booking',
+        title: `New booking created — #${booking_id}`,
+        body:  `Booking for ${patient_name || 'patient'} from ${service_start_date || '—'} to ${service_end_date || '—'}.`,
+        data:  { booking_id, route: 'bookings' },
       });
 
       // ── Send booking confirmation email (non-blocking) ──────────────────────
       setImmediate(async () => {
         try {
-          const user = await db('edx_web_app_users')
-            .where({ id: user_id })
-            .where('org_id', getOrgId(req))
-            .select('user_email', 'user_name')
-            .first();
-          if (user && user.user_email && user.user_email !== 'NA') {
-            const serviceRow = await db('edx_service_types')
-              .where({ id: service_type_id })
-              .select('service_type_name')
+          // bookings.user_id is a CLIENT id → edx_client_app_users.
+          const user = await getClientContact(user_id, orgId);
+          if (user && user.user_email) {
+            const serviceRow = await db('edx_master_services')
+              .where({ id: service_type_id, org_id: orgId })
+              .select('name')
               .first();
             const tpl = bookingConfirmed({
               clientName:  user.user_name || 'Client',
               patientName: patient_name  || 'Patient',
-              serviceType: serviceRow?.service_type_name || 'Elder Care Service',
+              serviceType: serviceRow?.name || 'Elder Care Service',
               startDate:   service_start_date || '—',
               endDate:     service_end_date   || '—',
               bookingId:   booking_id,
@@ -240,49 +293,31 @@ const createBooking = async (req, res) => {
 
   const updatePatient = async (req, res) => {
     try {
-      const {
-        
-        patient_name,
-        phone_number,
-        email,
-        age,
-        yob,
-        weight,
-        languages,
-        relation,
-        gender,
-        is_stay_alone,
-        patient_id
-               
-      } = req.body;
+      const { patient_id } = req.body;
       const userId = req.login_data.id;
-      // console.log(req.body)
-      
-      // Insert into DB
-     await db('edx_patient')
-     .where({ id: patient_id, org_id: getOrgId(req) })
-     .update({
-        
-        patient_name: patient_name ? patient_name : 'NA',
-        phone_number: phone_number ? phone_number : 'NA',
-        email: email ? email : 'NA',
-        age:age?age:'NA',
-        yob:yob?yob:'NA',
-        weight: weight ? weight : 'NA',
-        languages: languages ? languages : 'NA',
-        relation: relation ? relation : 'NA',
-        gender: gender ? gender : 'NA',
-        is_stay_alone: is_stay_alone ? is_stay_alone : 'NA',
-        updated_by:userId,
-        updated_on: getCurrentDateTime()
-  
-      });
-  
-  
+      if (!patient_id) return res.status(400).json({ message: 'patient_id is required.' });
+
+      // Only fields with a value are written; omitted or blank fields keep
+      // their stored value (previously they were overwritten with 'NA').
+      const editable = ['patient_name', 'phone_number', 'email', 'age', 'yob', 'weight',
+        'languages', 'relation', 'gender', 'is_stay_alone'];
+      const payload = {};
+      for (const k of editable) {
+        const v = req.body[k];
+        if (v !== undefined && v !== null && String(v).trim() !== '') payload[k] = v;
+      }
+      if (!Object.keys(payload).length) return res.status(400).json({ message: 'No patient fields supplied.' });
+      payload.updated_by = userId;
+      payload.updated_on = getCurrentDateTime();
+
+      const updated = await db('edx_patient')
+        .where({ id: patient_id, org_id: getOrgId(req) })
+        .update(payload);
+      if (!updated) return res.status(404).json({ message: 'Patient not found.' });
+
       res.status(201).json({ message: 'Patient updated successfully.' });
     } catch (err) {
       logger.error(`Error update patient: ${err.message}`);
-      console.error(err);
       res.status(500).json({ message: 'Error update Booking.' });
     }
   };
@@ -433,7 +468,7 @@ const createBooking = async (req, res) => {
         entityId:   bookingId,
         action:     'UPDATE',
         changedBy:  req.login_data?.id,
-        org_id:     req.login_data?.org_id ?? 1,
+        org_id:     getOrgId(req),
         oldValues:  { status: existingBooking.status },
         newValues:  updatePayload,
       });
@@ -452,7 +487,7 @@ const createBooking = async (req, res) => {
           new_rate:      final_rate,
           effective_date: updatePayload.service_start_date || getCurrentDateTime(),
           changed_by:    req.login_data?.id,
-          org_id:        req.login_data?.org_id ?? 1,
+          org_id:        getOrgId(req),
           reason:        'Rate updated via booking edit',
         }));
       }
@@ -521,7 +556,7 @@ const createBooking = async (req, res) => {
       });
       // ✅ Generate OTP when status = 3
 if (status == 3) {
-  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const otp = String(crypto.randomInt(100000, 1000000));
   updatePayload.otp = otp;
 
   // ── Send OTP to HP via email (non-blocking) ─────────────────────────────
@@ -625,6 +660,10 @@ else if (status == 5) {
         
       } = req.body;
       const userId = req.login_data.id;
+      const orgId = getOrgId(req);
+
+      const holdTarget = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first('id', 'user_id', 'final_rate');
+      if (!holdTarget) return res.status(404).json({ message: 'Booking not found.' });
 
       await withTransaction(async (trx) => {
         await trx('edx_hold_booking').insert(withOrg(req, {
@@ -655,7 +694,7 @@ else if (status == 5) {
         entityId:   booking_id,
         action:     'STATUS_CHANGE',
         changedBy:  userId,
-        org_id:     req.login_data?.org_id ?? 1,
+        org_id:     getOrgId(req),
         newValues:  { status: 'HOLD', from_date, to_date, reason },
       });
 
@@ -665,24 +704,17 @@ else if (status == 5) {
         from_date,
         to_date,
         inv_id:     inv_id || null,
-        org_id:     req.login_data?.org_id ?? 1,
+        org_id:     getOrgId(req),
         created_by: userId,
       }));
 
       // ── Notify client of service hold (fire-and-forget) ─────────────────────
       setImmediate(async () => {
         try {
-          const booking = await db('edx_bookings as b')
-            .leftJoin('edx_web_app_users as u', 'b.user_id', 'u.id')
-            .where('b.id', booking_id)
-            .where('b.org_id', getOrgId(req))
-            .select('u.user_email', 'u.user_name')
-            .first();
-          if (booking && booking.user_email && booking.user_email !== 'NA') {
-            const booking_data = await db('edx_bookings')
-              .where({ id: booking_id, org_id: getOrgId(req) })
-              .first();
-            const finalRate = parseFloat(booking_data?.final_rate) || 0;
+          // bookings.user_id is a CLIENT id → edx_client_app_users.
+          const booking = await getClientContact(holdTarget.user_id, orgId);
+          if (booking && booking.user_email) {
+            const finalRate = parseFloat(holdTarget.final_rate) || 0;
             let holdDays = 0;
             if (from_date && to_date) {
               const s = new Date(from_date);
@@ -729,8 +761,14 @@ else if (status == 5) {
         });
       }
   
-      // continue logic...
-  
+      const orgId = getOrgId(req);
+      const [targetBooking, targetHp] = await Promise.all([
+        db('edx_bookings').where({ id: booking_id, org_id: orgId }).first('id'),
+        db('edx_hp_registration').where({ hp_reg_id: hp_id, org_id: orgId }).first('hp_reg_id'),
+      ]);
+      if (!targetBooking) return res.status(404).json({ status: false, message: 'Booking not found.' });
+      if (!targetHp) return res.status(404).json({ status: false, message: 'HP not found.' });
+
       await withTransaction(async (trx) => {
         await trx('edx_booking_hp').insert(withOrg(req, {
           bkng_id: Number(booking_id),
@@ -760,7 +798,6 @@ else if (status == 5) {
       res.status(500).json({
         status: false,
         message: "Internal server error",
-        error: err.message,
       });
     }
   };
@@ -879,7 +916,7 @@ else if (status == 5) {
     } catch (err) {
       logger.error(`Error marking attendance: ${err.message}`);
       console.error(err);
-      res.status(500).json({ message: 'Error marking attendance.', error: err.message });
+      res.status(500).json({ message: 'Error marking attendance.' });
     }
   };
 
@@ -942,7 +979,7 @@ else if (status == 5) {
     } catch (err) {
       logger.error(`Error markAttendanceBatch: ${err.message}`);
       console.error(err);
-      res.status(500).json({ message: 'Error saving attendance batch.', error: err.message });
+      res.status(500).json({ message: 'Error saving attendance batch.' });
     }
   };
   const getAttendanceList = async (req, res) => {
@@ -1023,6 +1060,10 @@ else if (status == 5) {
         
       } = req.body;
       const userId = req.login_data.id;
+      const orgId = getOrgId(req);
+
+      const cancelTarget = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first('id', 'user_id');
+      if (!cancelTarget) return res.status(404).json({ message: 'Booking not found.' });
 
       await withTransaction(async (trx) => {
         await trx('edx_service_closed').insert(withOrg(req, {
@@ -1047,6 +1088,7 @@ else if (status == 5) {
       const billingSummary = await _computeCancellationBilling({
         booking_id,
         cancel_date: term_date || null,
+        org_id:      orgId,
       });
 
       res.status(201).json({
@@ -1060,8 +1102,15 @@ else if (status == 5) {
         entityId:   booking_id,
         action:     'STATUS_CHANGE',
         changedBy:  userId,
-        org_id:     req.login_data?.org_id ?? 1,
+        org_id:     getOrgId(req),
         newValues:  { status: 'CANCELLED', term_reason, booking_status },
+      });
+
+      notifyOrgAdmins(getOrgId(req), {
+        type:  'booking',
+        title: `Booking #${booking_id} cancelled`,
+        body:  `Service closed${term_reason && term_reason !== 'NA' ? ` — ${term_reason}` : ''}${term_date && term_date !== 'NA' ? ` (effective ${term_date})` : ''}.`,
+        data:  { booking_id, route: 'bookings' },
       });
 
       // ── Auto-create cancellation invoice or write-off trigger (fire-and-forget)
@@ -1069,11 +1118,8 @@ else if (status == 5) {
         try {
           if (!billingSummary) return;
           const { owing, refundable } = billingSummary;
-          const bookingData = await db('edx_bookings as b')
-            .leftJoin('edx_web_app_users as u', 'b.user_id', 'u.id')
-            .where('b.id', booking_id)
-            .select('u.user_email', 'u.user_name', 'u.user_mobile')
-            .first();
+          // bookings.user_id is a CLIENT id → edx_client_app_users.
+          const bookingData = await getClientContact(cancelTarget.user_id, orgId);
 
           // If client owes more → raise cancellation invoice
           if (owing > 0) {
@@ -1085,7 +1131,7 @@ else if (status == 5) {
               inv_date:        getCurrentDateTime(),
               due_date:        mysqlDateAddDays(7),
               invoice_type:    'Regular',
-              org_id:          req.login_data?.org_id ?? 1,
+              org_id:          getOrgId(req),
               created_by:      userId,
               created_on:      getCurrentDateTime(),
             });
@@ -1100,7 +1146,7 @@ else if (status == 5) {
               reason:          `Refund due to service cancellation — ${term_reason || ''}`,
               status:          'Pending',
               write_off_date:  getCurrentDateTime(),
-              org_id:          req.login_data?.org_id ?? 1,
+              org_id:          getOrgId(req),
               created_by:      userId,
               created_on:      getCurrentDateTime(),
             });
@@ -1108,7 +1154,7 @@ else if (status == 5) {
           }
 
           // Send cancellation billing email
-          if (bookingData && bookingData.user_email && bookingData.user_email !== 'NA') {
+          if (bookingData && bookingData.user_email) {
             const tpl = cancellationBillingSummary({
               clientName:  bookingData.user_name || 'Client',
               bookingId:   booking_id,
@@ -1173,11 +1219,15 @@ else if (status == 5) {
       const finalRate = parseFloat(booking.final_rate) || parseFloat(booking.base_rate) || 0;
       const inv_raised_amnt = totalDays * finalRate;
 
-      // Due date = today + payment terms (default 15 days). Use local-date
-      // formatting to avoid the UTC off-by-one in timezones ahead of UTC.
-      const paymentTermsDays = parseInt(process.env.PAYMENT_TERMS_DAYS || '15');
+      // Due date = today + the org's payment terms (Settings → Organisation
+      // Profile), falling back to env/15 days. Use local-date formatting to
+      // avoid the UTC off-by-one in timezones ahead of UTC.
+      const orgTerms = await getOrgBrand(db, getOrgId(req));
+      const paymentTermsDays = Number(orgTerms?.payment_terms_days)
+        || parseInt(process.env.PAYMENT_TERMS_DAYS || '15');
       const dueDateStr = mysqlDateAddDays(paymentTermsDays);
 
+      let ext_invoice_id;
       await withTransaction(async (trx) => {
         const [invoice_id] = await trx('edx_invoice').insert(withOrg(req, {
           booking_id: booking_id,
@@ -1190,6 +1240,7 @@ else if (status == 5) {
           created_by: userId,
           created_on: getCurrentDateTime()
         }));
+        ext_invoice_id = invoice_id;
 
         await trx('edx_extension_booking').insert(withOrg(req, {
           booking_id: booking_id,
@@ -1233,23 +1284,39 @@ else if (status == 5) {
         due_date: dueDateStr,
       });
 
+      notifyOrgAdmins(getOrgId(req), {
+        type:  'booking',
+        title: `Booking #${booking_id} extended to ${to_date}`,
+        body:  `Extension invoice INV-${ext_invoice_id} raised for ₹${Number(inv_raised_amnt).toLocaleString('en-IN')} (${totalDays} days, due ${dueDateStr}).`,
+        data:  { booking_id, invoice_id: ext_invoice_id, route: 'bookings' },
+      });
+
       // ── Send extension invoice email (fire-and-forget) ────────────────────
       setImmediate(async () => {
         try {
-          const user = await db('edx_web_app_users')
-            .where({ id: booking.user_id })
-            .select('user_email', 'user_name')
-            .first();
-          if (user && user.user_email && user.user_email !== 'NA') {
-            const tpl = invoiceGenerated({
-              clientName: user.user_name || 'Client',
-              bookingId:  booking_id,
-              amount:     inv_raised_amnt,
-              periodFrom: from_date,
-              periodTo:   to_date,
-              invoiceId:  `EXT-${booking_id}`,
+          const [user, org, meta] = await Promise.all([
+            getClientContact(booking.user_id, getOrgId(req)), // client id → edx_client_app_users
+            getOrgBrand(db, getOrgId(req)),
+            db('edx_bookings as b')
+              .where({ 'b.id': booking_id, 'b.org_id': getOrgId(req) })
+              .leftJoin('edx_patient as p', 'b.patient_id', 'p.id')
+              .leftJoin('edx_master_services as ms', 'b.service_type_id', 'ms.id')
+              .first('p.patient_name', 'ms.name as service_name'),
+          ]);
+          if (user && user.user_email) {
+            const tpl = invoiceEmail({
+              org,
+              clientName:  user.user_name || 'Client',
+              invoiceId:   ext_invoice_id || `EXT-${booking_id}`,
+              bookingId:   booking_id,
+              patientName: meta?.patient_name,
+              serviceName: `Service extension — ${meta?.service_name || 'care services'}`,
+              amount:      inv_raised_amnt,
+              periodFrom:  from_date,
+              periodTo:    to_date,
+              dueDate:     dueDateStr,
             });
-            await sendEmail({ to: user.user_email, ...tpl });
+            await sendEmail({ to: user.user_email, fromName: org?.name, ...tpl });
           }
         } catch (emailErr) {
           logger.warn(`[email] Extension invoice email failed for booking #${booking_id}: ${emailErr.message}`);
@@ -1361,8 +1428,10 @@ else if (status == 5) {
       /* 5️⃣ Calculate invoice */
       const invoiceAmount = totalDays * finalRate;
   
-      /* 6️⃣ Insert invoice with due_date */
-      const invPaymentTermsDays = parseInt(process.env.PAYMENT_TERMS_DAYS || '15');
+      /* 6️⃣ Insert invoice with due_date (org payment terms, env fallback) */
+      const invOrgTerms = await getOrgBrand(db, getOrgId(req));
+      const invPaymentTermsDays = Number(invOrgTerms?.payment_terms_days)
+        || parseInt(process.env.PAYMENT_TERMS_DAYS || '15');
       const invDueDateStr = mysqlDateAddDays(invPaymentTermsDays);
 
       const [invoice_id] = await trx('edx_invoice').insert(withOrg(req, {
@@ -1422,20 +1491,29 @@ else if (status == 5) {
       // ── Send invoice email to client (non-blocking) ─────────────────────────
       setImmediate(async () => {
         try {
-          const user = await db('edx_web_app_users')
-            .where({ id: booking.user_id })
-            .select('user_email', 'user_name')
-            .first();
-          if (user && user.user_email && user.user_email !== 'NA') {
-            const tpl = invoiceGenerated({
-              clientName: user.user_name || 'Client',
-              bookingId:  booking_id,
-              amount:     invoiceAmount,
-              periodFrom: booking.service_start_date || '—',
-              periodTo:   booking.service_end_date   || '—',
-              invoiceId:  invoice_id,
+          const [user, org, meta] = await Promise.all([
+            getClientContact(booking.user_id, getOrgId(req)), // client id → edx_client_app_users
+            getOrgBrand(db, getOrgId(req)),
+            db('edx_bookings as b')
+              .where({ 'b.id': booking_id, 'b.org_id': getOrgId(req) })
+              .leftJoin('edx_patient as p', 'b.patient_id', 'p.id')
+              .leftJoin('edx_master_services as ms', 'b.service_type_id', 'ms.id')
+              .first('p.patient_name', 'ms.name as service_name'),
+          ]);
+          if (user && user.user_email) {
+            const tpl = invoiceEmail({
+              org,
+              clientName:  user.user_name || 'Client',
+              invoiceId:   invoice_id,
+              bookingId:   booking_id,
+              patientName: meta?.patient_name,
+              serviceName: meta?.service_name,
+              amount:      invoiceAmount,
+              periodFrom:  booking.service_start_date || '—',
+              periodTo:    booking.service_end_date   || '—',
+              dueDate:     invDueDateStr,
             });
-            await sendEmail({ to: user.user_email, ...tpl });
+            await sendEmail({ to: user.user_email, fromName: org?.name, ...tpl });
           }
         } catch (emailErr) {
           logger.warn(`[email] Invoice email failed for booking #${booking_id}: ${emailErr.message}`);
@@ -1490,7 +1568,7 @@ else if (status == 5) {
           });
       }
 
-      const otpData = await getBookings.getOTP(bkng_id, hp_unique_id);
+      const otpData = await getBookings.getOTP(bkng_id, hp_unique_id, getOrgId(req));
 
       if (!otpData) {
           return res.status(404).json({
@@ -1560,9 +1638,10 @@ const getMatchedHPs = async (req, res) => {
     //    (A conflict = they have a booking that overlaps the requested date range
     //     with status Active/Confirmed/In-Progress)
     const conflictingHpIds = (await db('edx_booking_hp as bh')
-      .join('edx_bookings as b2', 'bh.booking_id', 'b2.id')
+      .join('edx_bookings as b2', 'bh.bkng_id', 'b2.id')
       .where('b2.org_id', getOrgId(req))
-      .whereIn('b2.status', ['Active', 'Confirmed', 'In-Progress', 'confirmed', 'active'])
+      .where('bh.org_id', getOrgId(req))
+      .whereIn('b2.status', ENGAGED_BOOKING_STATUSES)
       .where(function () {
         this
           .where('b2.service_start_date', '<=', booking.service_end_date)
@@ -1592,7 +1671,7 @@ const getMatchedHPs = async (req, res) => {
 
     // 3. Fetch client-history: HP → user booking pairs
     const historyRows = await db('edx_booking_hp as bh')
-      .join('edx_bookings as b3', 'bh.booking_id', 'b3.id')
+      .join('edx_bookings as b3', 'bh.bkng_id', 'b3.id')
       .where('b3.user_id', userId)
       .where('b3.org_id', getOrgId(req))
       .select('bh.hp_unique_id');
@@ -1644,11 +1723,11 @@ const getMatchedHPs = async (req, res) => {
     });
   } catch (err) {
     logger.error(`[matchHP] error: ${err.message}`);
-    res.status(500).json({ message: 'Failed to match HPs.', details: err.message });
+    res.status(500).json({ message: 'Failed to match HPs.' });
   }
 };
 
-module.exports = {
+module.exports = guardOrgHandlers({
     createBooking,
     getUserBookings,
     holdBooking,
@@ -1665,4 +1744,4 @@ module.exports = {
     finalBookingSave,
     getMatchedHPs,  // Phase 4.4
     getAttendanceList,
-  };
+  });

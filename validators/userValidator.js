@@ -5,7 +5,10 @@ const loginWebSchema = Joi.object({
     'string.email': 'A valid email address is required',
     'any.required': 'Email is required'
   }),
-  password: Joi.string().allow('').optional()
+  password: Joi.string().min(1).required().messages({
+    'string.empty': 'Password is required',
+    'any.required': 'Password is required'
+  })
 });
 
 const createUserSchema = Joi.object({

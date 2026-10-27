@@ -13,6 +13,17 @@ const db     = require('../../config/db');
 const logger = require('../../logger');
 const { getCurrentDateTime } = require('../../utils/dateTime');
 const { logAudit }           = require('../../utils/auditLogger');
+const withTransaction        = require('../../utils/withTransaction');
+const { getOrgId }           = require('../../utils/orgScope');
+const { orgStatusForSubscription } = require('../../utils/orgStatus');
+const { invalidateOrgStatusCache } = require('../../middlewares/orgStatusGate');
+const { countActiveBookings, countActiveHPs } = require('../../utils/planUsage');
+
+// edx_subscriptions.status values an owner may set directly.
+const SUBSCRIPTION_STATUSES = ['trial', 'active', 'suspended', 'expired', 'cancelled'];
+
+// Audit org for platform-level entities (plans) that belong to no tenant.
+const PLATFORM_ORG_ID = 0;
 
 function requireSuperadmin(req, res) {
   // Owner = is_owner JWT claim from /ownerLogin, never a tenant role.
@@ -41,7 +52,14 @@ const getPlans = async (req, res) => {
 
 const getSubscriptionStatus = async (req, res) => {
   try {
-    const orgId = req.login_data?.org_id ?? 1;
+    // Staff read their own org; the owner may ask about a target org.
+    const orgId = req.login_data?.is_owner === true
+      ? parseInt(req.query.org_id, 10) || null
+      : getOrgId(req);
+    if (!orgId) {
+      return res.status(req.login_data?.is_owner === true ? 400 : 401)
+        .json({ message: 'Organisation context is required.' });
+    }
 
     const sub = await db('edx_subscriptions as s')
       .join('edx_plans as p', 's.plan_id', 'p.id')
@@ -84,6 +102,15 @@ const updateOrgPlan = async (req, res) => {
     if (!org_id || !plan_id) {
       return res.status(400).json({ message: 'org_id and plan_id are required.' });
     }
+    if (!SUBSCRIPTION_STATUSES.includes(status)) {
+      return res.status(400).json({ message: `status must be one of: ${SUBSCRIPTION_STATUSES.join(', ')}.` });
+    }
+    if (expires_on && !/^\d{4}-\d{2}-\d{2}/.test(String(expires_on))) {
+      return res.status(400).json({ message: 'expires_on must be YYYY-MM-DD.' });
+    }
+
+    const targetOrg = await db('edx_organizations').where('id', org_id).first('id', 'status');
+    if (!targetOrg) return res.status(404).json({ message: 'Organisation not found.' });
 
     const targetPlan = await db('edx_plans').where('id', plan_id).first();
     if (!targetPlan) return res.status(404).json({ message: 'Plan not found.' });
@@ -96,20 +123,8 @@ const updateOrgPlan = async (req, res) => {
 
     if (currentSub && parseInt(currentSub.plan_id) > parseInt(plan_id)) {
       // Moving to a lower plan — check usage
-      const bookingsUsed = await db('edx_bookings')
-        .where('org_id', org_id)
-        .whereNotIn('status', ['Cancelled'])
-        .count('id as cnt')
-        .first()
-        .then(r => parseInt(r?.cnt || 0));
-
-      const hpUsed = await db('edx_hp_registration')
-        .where('org_id', org_id)
-        .where('is_active', 1)
-        .count('id as cnt')
-        .first()
-        .then(r => parseInt(r?.cnt || 0))
-        .catch(() => 0);
+      const bookingsUsed = await countActiveBookings(org_id);
+      const hpUsed       = await countActiveHPs(org_id);
 
       const bookingLimit = targetPlan.booking_limit || 0;
       const hpLimit      = targetPlan.hp_limit      || 0;
@@ -128,34 +143,38 @@ const updateOrgPlan = async (req, res) => {
       }
     }
 
-    // Upsert: deactivate any existing active subscription, then insert new
-    await db('edx_subscriptions')
-      .where({ org_id, status: 'active' })
-      .update({ status: 'cancelled' });
+    // One transaction: close the live subscription(s), open the new one and
+    // keep edx_organizations (plan + kill-switch status) in lock-step with it.
+    const newOrgStatus = orgStatusForSubscription(status);
+    const id = await withTransaction(async (trx) => {
+      await trx('edx_subscriptions')
+        .where({ org_id })
+        .whereIn('status', ['active', 'trial'])
+        .update({ status: 'cancelled', updated_on: getCurrentDateTime() });
 
-    const [id] = await db('edx_subscriptions').insert({
-      org_id,
-      plan_id,
-      status,
-      started_on:    getCurrentDateTime(),
-      expires_on:    expires_on || null,
-      activated_by:  req.login_data.id,
-      created_on:    getCurrentDateTime(),
-    });
-
-    // Also update the org's plan_id reference
-    await db('edx_organizations').where({ id: org_id }).update({ plan_id });
-
-    const { logAudit } = require('../../utils/auditLogger');
-    setImmediate(() => {
-      logAudit({
-        entityType: 'ORGANISATION',
-        entityId:   org_id,
-        action:     'STATUS_CHANGE',
-        changedBy:  req.login_data.id,
-        oldValues:  { plan_id: currentSub?.plan_id },
-        newValues:  { plan_id, status, reason },
+      const [subId] = await trx('edx_subscriptions').insert({
+        org_id,
+        plan_id,
+        status,
+        started_on:    getCurrentDateTime(),
+        expires_on:    expires_on || null,
+        activated_by:  req.login_data.id,
+        created_on:    getCurrentDateTime(),
       });
+
+      await trx('edx_organizations').where({ id: org_id }).update({ plan_id, status: newOrgStatus });
+      return subId;
+    });
+    invalidateOrgStatusCache(org_id);
+
+    logAudit({
+      entityType: 'ORGANISATION',
+      entityId:   Number(org_id),
+      action:     'STATUS_CHANGE',
+      changedBy:  req.login_data.id,
+      org_id:     Number(org_id),
+      oldValues:  { plan_id: currentSub?.plan_id, sub_status: currentSub?.status, org_status: targetOrg.status },
+      newValues:  { plan_id, status, org_status: newOrgStatus, expires_on: expires_on || null, reason },
     });
 
     const sub = await db('edx_subscriptions').where({ id }).first();
@@ -231,6 +250,7 @@ const createPlan = async (req, res) => {
       entityId:   id,
       action:     'CREATE',
       changedBy:  req.login_data.id,
+      org_id:     PLATFORM_ORG_ID,
       newValues:  { name, booking_limit, hp_limit, price_per_month, features },
     });
 
@@ -290,19 +310,8 @@ const updatePlan = async (req, res) => {
 
       const affected = [];
       for (const org of orgsOnPlan) {
-        const bookingsUsed = await db('edx_bookings')
-          .where('org_id', org.id)
-          .whereNotIn('status', ['Cancelled'])
-          .count('id as cnt')
-          .first()
-          .then((r) => parseInt(r?.cnt || 0));
-        const hpUsed = await db('edx_hp_registration')
-          .where('org_id', org.id)
-          .where('is_active', 1)
-          .count('id as cnt')
-          .first()
-          .then((r) => parseInt(r?.cnt || 0))
-          .catch(() => 0);
+        const bookingsUsed = await countActiveBookings(org.id);
+        const hpUsed       = await countActiveHPs(org.id);
 
         const overBookings = newBookingLimit > 0 && bookingsUsed > newBookingLimit;
         const overHp       = newHpLimit > 0 && hpUsed > newHpLimit;
@@ -334,6 +343,7 @@ const updatePlan = async (req, res) => {
       entityId:   Number(id),
       action:     'UPDATE',
       changedBy:  req.login_data.id,
+      org_id:     PLATFORM_ORG_ID,
       oldValues:  {
         name: plan.name,
         booking_limit: plan.booking_limit,
@@ -369,6 +379,7 @@ const togglePlanActive = async (req, res) => {
       entityId:   Number(id),
       action:     'STATUS_CHANGE',
       changedBy:  req.login_data.id,
+      org_id:     PLATFORM_ORG_ID,
       oldValues:  { is_active: !!plan.is_active },
       newValues:  { is_active: newValue },
     });

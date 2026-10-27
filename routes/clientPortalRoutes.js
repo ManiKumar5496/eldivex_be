@@ -10,6 +10,7 @@ const router = express.Router();
 
 const { authLimiter } = require('../middlewares/rateLimiter');
 const clientAuth = require('../middlewares/clientAuth');
+const upload = require('../middlewares/upload');
 const clientAuthCtrl = require('../controllers/web_app/clientAuthController');
 const c = require('../controllers/web_app/clientPortalController');
 
@@ -19,10 +20,16 @@ router.post('/clientAuth/verifyOtp',  authLimiter, clientAuthCtrl.verifyOtp);
 
 // ── Profile ────────────────────────────────────────────────────────────────────
 router.get('/client/me',                 clientAuth, c.getMe);
-router.put('/client/me',                 clientAuth, c.updateMe);
+// JSON body, or multipart with an optional `user_image` file.
+router.put('/client/me',                 clientAuth, upload.fields([{ name: 'user_image', maxCount: 1 }]), c.updateMe);
+
+// ── Addresses ──────────────────────────────────────────────────────────────────
+router.get('/client/addresses',          clientAuth, c.getAddresses);
+router.post('/client/addresses',         clientAuth, c.createAddress);
 
 // ── Bookings ─────────────────────────────────────────────────────────────────
 router.get('/client/bookings',           clientAuth, c.getBookings);
+router.post('/client/bookings',          clientAuth, c.createBooking);
 router.get('/client/bookings/:id',       clientAuth, c.getBookingById);
 router.get('/client/bookings/:id/hp',    clientAuth, c.getAssignedHp);
 router.get('/client/bookings/:id/attendance', clientAuth, c.getBookingAttendance);

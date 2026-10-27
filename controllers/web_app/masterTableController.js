@@ -7,7 +7,8 @@ const uploadHandler=require('../../middlewares/uploadHandler')
 const { generateToken } = require('../../utils/jwt');
 const { getCurrentDateTime } = require("../../utils/dateTime");
 const { logAudit } = require('../../utils/auditLogger'); // Phase 4.2
-const { withOrg, getOrgId } = require('../../utils/orgScope');
+const { withOrg, getOrgId, orgQuery } = require('../../utils/orgScope');
+const { guardOrgHandlers } = require('../../utils/requestOrg');
 
 
 const getLangC = async (req, res) =>  {
@@ -95,8 +96,9 @@ const getLangC = async (req, res) =>  {
 
   const getAddress = async (req, res) =>  {
     try {
-      const filters = req.query;
-      // console.log(filters)
+      // org_id is taken from the authenticated token, never the client query,
+      // so one tenant can never read another tenant's addresses.
+      const filters = { ...req.query, org_id: getOrgId(req) };
       const getAddress = await getMasterData.getAddressModel(filters);
   
       res.json(getAddress);
@@ -141,8 +143,11 @@ const getLangC = async (req, res) =>  {
       }
   
       // 🔍 Check duplicate using SAME MODEL
+      // Coupon names are unique per org (migration 030), not globally.
       const existingCoupon = await getMasterData.getcouponsModel({
         coupon_name,
+        org_id: getOrgId(req),
+        includeInactive: true,
         checkDuplicate: true
       });
   
@@ -193,10 +198,11 @@ const getLangC = async (req, res) =>  {
   
         
       } = req.body;
-      // const userId = req.user.id;
-  
-  
-      const [address_id ] = await db('edx_user_address').insert({
+      // The client must belong to the caller's org.
+      const client = await db('edx_client_app_users').where({ id: user_id, org_id: getOrgId(req) }).first('id');
+      if (!client) return res.status(404).json({ message: 'Client not found.' });
+
+      const [address_id ] = await db('edx_user_address').insert(withOrg(req, {
     user_id : user_id,
     address_tag_name : address_tag_name  ? address_tag_name  : 'NA',
     country : country  ? country  : 'NA',
@@ -209,9 +215,9 @@ const getLangC = async (req, res) =>  {
     pincode : pincode  ? pincode  : 'NA',
     // created_by:userId,
     created_on: new Date()
-  
-  });
-      res.status(201).json({ message: 'Address added successfully.' });
+
+  }));
+      res.status(201).json({ message: 'Address added successfully.', address_id, id: address_id });
     } catch (err) {
       logger.error(`Error adding address: ${err.message}`);
       console.error(err);
@@ -313,17 +319,21 @@ const getLangC = async (req, res) =>  {
 
 const createService = async (req, res) => {
   try {
-    const { name, service_category_id, branch_id, service_type = 1, service_rate, market_rate, effective_from_date } = req.body;
+    const { name, description, service_category_id, branch_id, service_type = 1, gender, care_type, service_rate, market_rate, effective_from_date } = req.body;
     if (!name) return res.status(400).json({ message: 'Service name is required.' });
 
-    const existing = await db('edx_master_services').where({ name }).first();
+    // Duplicate check scoped to this org — two tenants may use the same service name.
+    const existing = await orgQuery(req, 'edx_master_services').where({ name }).first();
     if (existing) return res.status(409).json({ message: 'A service with this name already exists.' });
 
     const [id] = await db('edx_master_services').insert(withOrg(req, {
       name,
+      description:          description          || null,
       service_category_id:  service_category_id  || null,
       branch_id:            branch_id            || null,
       service_type,
+      gender:               gender               || 'Any',
+      care_type:            care_type            || null,
       service_rate:         service_rate         || null,
       market_rate:          market_rate          || null,
       effective_from_date:  effective_from_date  || null,
@@ -340,11 +350,11 @@ const createService = async (req, res) => {
 const updateService = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, service_category_id, branch_id, service_type, service_rate, market_rate, effective_from_date, effective_to_date } = req.body;
+    const { name, description, service_category_id, branch_id, service_type, gender, care_type, service_rate, market_rate, effective_from_date, effective_to_date } = req.body;
 
     // Validate: rate change requires an effective date
     if (service_rate !== undefined) {
-      const current = await db('edx_master_services').where({ id }).select('service_rate').first();
+      const current = await db('edx_master_services').where({ id, org_id: getOrgId(req) }).select('service_rate').first();
       const rateChanged = current && String(current.service_rate ?? '') !== String(service_rate);
       if (rateChanged) {
         if (!effective_from_date) {
@@ -359,15 +369,19 @@ const updateService = async (req, res) => {
 
     const payload = {};
     if (name                !== undefined) payload.name                = name;
+    if (description         !== undefined) payload.description         = description || null;
     if (service_category_id !== undefined) payload.service_category_id = service_category_id;
     if (branch_id           !== undefined) payload.branch_id           = branch_id;
     if (service_type        !== undefined) payload.service_type        = service_type;
+    if (gender              !== undefined) payload.gender              = gender || 'Any';
+    if (care_type           !== undefined) payload.care_type           = care_type || null;
     if (service_rate        !== undefined) payload.service_rate        = service_rate || null;
     if (market_rate         !== undefined) payload.market_rate         = market_rate  || null;
     if (effective_from_date !== undefined) payload.effective_from_date = effective_from_date || null;
     if (effective_to_date   !== undefined) payload.effective_to_date   = effective_to_date   || null;
 
-    await db('edx_master_services').where({ id }).update(payload);
+    const updated = await db('edx_master_services').where({ id, org_id: getOrgId(req) }).update(payload);
+    if (!updated) return res.status(404).json({ message: 'Service not found.' });
     res.json({ message: 'Service updated successfully.' });
     logAudit({ entityType: 'SERVICE', entityId: parseInt(id), action: 'UPDATE', changedBy: req.login_data?.id, org_id: getOrgId(req), newValues: payload });
   } catch (err) {
@@ -380,10 +394,10 @@ const toggleServiceStatus = async (req, res) => {
   try {
     const id = req.body?.id ?? req.query.id;
     if (!id) return res.status(400).json({ message: 'id is required.' });
-    const svc = await db('edx_master_services').where({ id }).select('status').first();
+    const svc = await db('edx_master_services').where({ id, org_id: getOrgId(req) }).select('status').first();
     if (!svc) return res.status(404).json({ message: 'Service not found.' });
     const newStatus = svc.status === 1 ? 0 : 1;
-    await db('edx_master_services').where({ id }).update({ status: newStatus });
+    await db('edx_master_services').where({ id, org_id: getOrgId(req) }).update({ status: newStatus });
     res.json({ message: `Service ${newStatus === 1 ? 'enabled' : 'disabled'} successfully.`, status: newStatus });
     logAudit({ entityType: 'SERVICE', entityId: parseInt(id), action: 'STATUS_CHANGE', changedBy: req.login_data?.id, org_id: getOrgId(req), oldValues: { status: svc.status }, newValues: { status: newStatus } });
   } catch (err) {
@@ -392,10 +406,33 @@ const toggleServiceStatus = async (req, res) => {
   }
 };
 
+// Service categories are per-org "products" (e.g. Caregiving, Nursing, Baby
+// Care). Every read/write is scoped to the caller's org so one tenant never
+// sees or mutates another tenant's catalogue.
+const getServiceCategories = async (req, res) => {
+  try {
+    // Admin management list — include inactive so they can be re-enabled.
+    const rows = await orgQuery(req, 'edx_master_services_category')
+      .select('id', db.raw('name as cat_name'), 'status')
+      .orderBy('id', 'desc');
+    res.json(rows);
+  } catch (err) {
+    logger.error(`Error fetching service categories: ${err.message}`);
+    res.status(500).json({ message: 'Error fetching service categories.' });
+  }
+};
+
 const createServiceCategory = async (req, res) => {
   try {
-    const { name } = req.body;
+    const name = (req.body.name || '').trim();
     if (!name) return res.status(400).json({ message: 'Category name is required.' });
+
+    // Reject duplicates within the same org (case-insensitive).
+    const existing = await orgQuery(req, 'edx_master_services_category')
+      .whereRaw('LOWER(name) = ?', [name.toLowerCase()])
+      .first();
+    if (existing) return res.status(409).json({ message: 'Category already exists.' });
+
     const [id] = await db('edx_master_services_category').insert(withOrg(req, { name, status: 1 }));
     res.status(201).json({ message: 'Service category created.', id });
   } catch (err) {
@@ -407,13 +444,32 @@ const createServiceCategory = async (req, res) => {
 const updateServiceCategory = async (req, res) => {
   try {
     const { id } = req.params;
-    const { name } = req.body;
+    const name = (req.body.name || '').trim();
     if (!name) return res.status(400).json({ message: 'Category name is required.' });
-    await db('edx_master_services_category').where({ id }).update({ name });
+
+    const updated = await orgQuery(req, 'edx_master_services_category')
+      .where({ id })
+      .update({ name });
+    if (!updated) return res.status(404).json({ message: 'Category not found.' });
     res.json({ message: 'Service category updated.' });
   } catch (err) {
     logger.error(`Error updating service category: ${err.message}`);
     res.status(500).json({ message: 'Error updating service category.' });
+  }
+};
+
+const toggleServiceCategoryStatus = async (req, res) => {
+  try {
+    const { id, status } = req.query;
+    const newStatus = Number(status) === 1 ? 1 : 0;
+    const updated = await orgQuery(req, 'edx_master_services_category')
+      .where({ id })
+      .update({ status: newStatus });
+    if (!updated) return res.status(404).json({ message: 'Category not found.' });
+    res.json({ message: 'Status updated.' });
+  } catch (err) {
+    logger.error(`Error toggling service category status: ${err.message}`);
+    res.status(500).json({ message: 'Error updating status.' });
   }
 };
 
@@ -451,7 +507,8 @@ const updateBranch = async (req, res) => {
     if (br_address !== undefined) payload.br_address = br_address;
     if (br_city    !== undefined) payload.br_city    = br_city;
     if (br_state   !== undefined) payload.br_state   = br_state;
-    await db('edx_branches').where({ br_id: id }).update(payload);
+    const updated = await db('edx_branches').where({ br_id: id, org_id: getOrgId(req) }).update(payload);
+    if (!updated) return res.status(404).json({ message: 'Branch not found.' });
     res.json({ message: 'Branch updated successfully.' });
     logAudit({ entityType: 'BRANCH', entityId: parseInt(id), action: 'UPDATE', changedBy: req.login_data?.id, org_id: getOrgId(req), newValues: payload });
   } catch (err) {
@@ -464,10 +521,10 @@ const toggleBranchStatus = async (req, res) => {
   try {
     const id = req.body?.id ?? req.query.id;
     if (!id) return res.status(400).json({ message: 'id is required.' });
-    const branch = await db('edx_branches').where({ br_id: id }).select('br_status').first();
+    const branch = await db('edx_branches').where({ br_id: id, org_id: getOrgId(req) }).select('br_status').first();
     if (!branch) return res.status(404).json({ message: 'Branch not found.' });
     const newStatus = branch.br_status === 1 ? 0 : 1;
-    await db('edx_branches').where({ br_id: id }).update({ br_status: newStatus });
+    await db('edx_branches').where({ br_id: id, org_id: getOrgId(req) }).update({ br_status: newStatus });
     res.json({ message: `Branch ${newStatus === 1 ? 'enabled' : 'disabled'} successfully.`, status: newStatus });
     logAudit({ entityType: 'BRANCH', entityId: parseInt(id), action: 'STATUS_CHANGE', changedBy: req.login_data?.id, org_id: getOrgId(req), oldValues: { br_status: branch.br_status }, newValues: { br_status: newStatus } });
   } catch (err) {
@@ -483,10 +540,10 @@ const getServicesList = async (req, res) => {
 
     let query = db('edx_master_services as s')
       .select(
-        's.id', 's.name', 's.description', 's.service_type',
+        's.id', 's.name', 's.description', 's.service_type', 's.gender', 's.care_type',
         's.service_category_id', 's.branch_id', 's.status',
         's.service_rate', 's.effective_from_date', 's.effective_to_date',
-        db.raw('c.category_name as category_name'),
+        db.raw('c.name as category_name'),
         db.raw('b.br_name as br_name'),
       )
       .leftJoin('edx_master_services_category as c', 's.service_category_id', 'c.id')
@@ -503,7 +560,7 @@ const getServicesList = async (req, res) => {
   }
 };
 
-module.exports = {
+module.exports = guardOrgHandlers({
     getAddress,
     getLangC,
     createWebRoles,
@@ -521,10 +578,12 @@ module.exports = {
     createService,
     updateService,
     toggleServiceStatus,
+    getServiceCategories,
     createServiceCategory,
     updateServiceCategory,
+    toggleServiceCategoryStatus,
     // Phase 2.6
     createBranch,
     updateBranch,
     toggleBranchStatus,
-  };
+  });

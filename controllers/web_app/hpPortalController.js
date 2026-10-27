@@ -9,6 +9,7 @@
 const db = require('../../config/db');
 const logger = require('../../logger');
 const { getCurrentDateTime } = require('../../utils/dateTime');
+const supportModel = require('../../models/web_app/supportModel');
 
 const DOC_URL = process.env.DOC_FOLDER_URL || '';
 
@@ -403,10 +404,10 @@ const hpTicketMarker = (hpId) => JSON.stringify({ source: 'caregiver', hp_id: hp
 
 const getSupportCategories = async (req, res) => {
   try {
-    // app_type 'hp' categories if present; fall back to all when none tagged.
-    let rows = await db('edx_support_category').where({ app_type: 'hp' }).select('id', 'name');
-    if (!rows.length) rows = await db('edx_support_category').select('id', 'name');
-    res.json(rows);
+    // This org's 'hp' (or 'all') categories; falls back to the org's other
+    // categories when none are tagged — never to another org's.
+    const rows = await supportModel.getSupportCategoryData({}, req.hp.org_id, 'hp');
+    res.json(rows.map(({ id, name }) => ({ id, name })));
   } catch (err) {
     logger.error(`Error hp getSupportCategories: ${err.message}`);
     res.status(500).json({ message: 'Error fetching support categories.' });
@@ -418,6 +419,10 @@ const createSupport = async (req, res) => {
     const { hp_id, org_id } = req.hp;
     const { support_type_id, title, description, booking_details } = req.body;
     if (!title || !description) return res.status(400).json({ message: 'title and description are required.' });
+    if (support_type_id) {
+      const cat = await db('edx_support_category').where({ id: support_type_id, org_id }).first('id');
+      if (!cat) return res.status(404).json({ message: 'Support category not found.' });
+    }
 
     // The table has no string "source" column (most are int FKs), so caregiver
     // tickets are tagged with a JSON marker in conversionlog_details and scoped

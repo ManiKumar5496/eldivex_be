@@ -5,13 +5,14 @@
 const express = require('express');
 const router  = express.Router();
 const auth    = require('../middlewares/auth');
+const requireStaff = require('../middlewares/requireStaff');
 const subscriptionController = require('../controllers/web_app/subscriptionController');
 
 const requireOwner = require('../middlewares/requireOwner');
 
 router.get('/getPlans',               subscriptionController.getPlans);          // public
-router.get('/getSubscriptionStatus',  auth, subscriptionController.getSubscriptionStatus);
-router.put('/updateOrgPlan',          auth, subscriptionController.updateOrgPlan); // role_id=1 check inside
+router.get('/getSubscriptionStatus',  auth, requireStaff, subscriptionController.getSubscriptionStatus);
+router.put('/updateOrgPlan',          auth, requireOwner, subscriptionController.updateOrgPlan);
 
 // ── Plans management (owner platform) ─────────────────────────────────────────
 router.get(  '/saas/getPlansWithUsage',   auth, requireOwner, subscriptionController.getPlansWithUsage);

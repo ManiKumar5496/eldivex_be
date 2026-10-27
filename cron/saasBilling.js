@@ -17,6 +17,7 @@ const db     = require('../config/db');
 const logger = require('../logger');
 const { logAudit } = require('../utils/auditLogger');
 const { getCurrentDateTime } = require('../utils/dateTime');
+const { notifyOrgAdmins } = require('../utils/notify');
 
 const DUE_DAY_OF_MONTH = 15;
 
@@ -84,6 +85,14 @@ async function generateMonthlyInvoices() {
           source: 'auto-billing-cron',
         },
       });
+
+      await notifyOrgAdmins(sub.org_id, {
+        type:  'subscription',
+        title: `Subscription invoice generated — ₹${Number(sub.price_per_month).toLocaleString('en-IN')}`,
+        body:  `Your monthly subscription invoice for ${periodMonth}/${periodYear} is ready (due ${dueDate}).`,
+        data:  { saas_invoice_id: id, route: 'subscription' },
+        dedupeKey: `saasinv:${sub.org_id}:${periodYear}-${periodMonth}`,
+      });
     } catch (err) {
       if (err.code === 'ER_DUP_ENTRY') continue; // raced with a manual invoice — fine
       logger.error(`[saasBilling] invoice insert failed for org ${sub.org_id}: ${err.message}`);
@@ -115,6 +124,14 @@ async function markOverdueInvoices() {
       org_id:     inv.org_id,
       oldValues:  { status: 'Sent' },
       newValues:  { status: 'Overdue', source: 'auto-billing-cron' },
+    });
+
+    await notifyOrgAdmins(inv.org_id, {
+      type:  'subscription',
+      title: `Subscription invoice overdue — #${inv.id}`,
+      body:  'Your subscription payment is overdue. Please pay to avoid suspension of access.',
+      data:  { saas_invoice_id: inv.id, route: 'subscription' },
+      dedupeKey: `saasoverdue:${inv.id}`,
     });
   }
 

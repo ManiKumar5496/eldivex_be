@@ -21,7 +21,11 @@ const createBookingSchema = Joi.object({
   languages: Joi.string().optional(),
   relation: Joi.string().optional(),
   gender: Joi.number().valid(1, 2, 3).optional(),
-  is_stay_alone: Joi.number().valid(0, 1).optional()
+  is_stay_alone: Joi.number().valid(0, 1).optional(),
+  // booking care details (optional)
+  patient_conditions_others: Joi.string().max(2000).allow('', null).optional(),
+  spl_care_requirements: Joi.string().max(2000).allow('', null).optional(),
+  placement_time: Joi.string().max(30).allow('', null).optional()
 });
 
 const extendBookingSchema = Joi.object({
