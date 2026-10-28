@@ -15,7 +15,7 @@
 
 const db = require('../config/db');
 const { getCurrentDateTime } = require('./dateTime');
-const { round2 } = require('./accountsCalc');
+const { round2, MONEY_EPS, parseLocalDate } = require('./accountsCalc');
 
 // Ledger types that lower (credit) / raise (debit) what the client owes.
 const LEDGER_CREDIT_TYPES = ['WRITE_OFF', 'CREDIT_NOTE_APPLIED', 'INTERNAL_TRANSFER_IN'];
@@ -136,11 +136,95 @@ async function computeOutstanding(orgId, scope, conn = db) {
   };
 }
 
+/**
+ * Credit an approved credit note's remaining amount to its own booking: the
+ * invoice it names first, then the booking's other invoices oldest first, each
+ * up to what the invoice billed less credit already applied to it. Posts one
+ * CREDIT_NOTE_APPLIED ledger entry and one edx_credit_note_applications row per
+ * invoice touched, and marks the note applied.
+ *
+ * The booking's outstanding drops at once. When the client had already paid,
+ * it goes below zero: that excess is what a refund or a credit-balance
+ * transfer to another booking of the same client moves on.
+ *
+ * Writes nothing and returns { ok: false, creditable } when the booking's
+ * invoices can't take the whole amount. Run inside the caller's transaction
+ * with the credit note row locked; the booking row is locked here.
+ */
+async function postCreditNoteToBooking(trx, { orgId, userId, creditNote, notes }) {
+  const amount = round2(creditNote.remaining_amount ?? creditNote.amount);
+  const booking = await trx('edx_bookings')
+    .where({ id: creditNote.booking_id, org_id: orgId })
+    .forUpdate()
+    .first('id', 'user_id');
+  if (!booking) return { ok: false, creditable: 0, invoiceCount: 0 };
+
+  const invoices = await trx('edx_invoice')
+    .where({ booking_id: booking.id, org_id: orgId })
+    .select('id', 'inv_raised_amnt', 'inv_start');
+  const time = (inv) => parseLocalDate(inv.inv_start)?.getTime() ?? Infinity;
+  const named = (inv) => String(inv.id) === String(creditNote.invoice_id);
+  (invoices || []).sort((a, b) =>
+    (named(b) - named(a)) || (time(a) - time(b)) || (a.id - b.id));
+
+  const creditedRows = invoices?.length
+    ? await trx('edx_credit_note_applications')
+      .whereIn('target_invoice_id', invoices.map((i) => i.id))
+      .where('status', 'APPLIED')
+      .select('target_invoice_id', trx.raw('SUM(amount_applied) as total'))
+      .groupBy('target_invoice_id')
+    : [];
+  const credited = new Map((creditedRows || []).map((r) => [String(r.target_invoice_id), Number(r.total) || 0]));
+
+  // How much each invoice can still take, in the order above.
+  let left = amount;
+  const plan = [];
+  let creditable = 0;
+  for (const inv of invoices || []) {
+    const room = Math.max(0, round2((Number(inv.inv_raised_amnt) || 0) - (credited.get(String(inv.id)) || 0)));
+    creditable = round2(creditable + room);
+    const take = round2(Math.min(left, room));
+    if (take > 0) { plan.push({ invoiceId: inv.id, amount: take }); left = round2(left - take); }
+  }
+  if (left > MONEY_EPS) return { ok: false, creditable, invoiceCount: (invoices || []).length };
+
+  const now = getCurrentDateTime();
+  const entryIds = [];
+  for (const p of plan) {
+    const entryId = await createTransactionEntry(trx, {
+      orgId, clientId: booking.user_id, bookingId: booking.id, invoiceId: p.invoiceId,
+      transactionType: 'CREDIT_NOTE_APPLIED', direction: 'CREDIT', amount: p.amount,
+      referenceId: creditNote.id, referenceType: 'CREDIT_NOTE',
+      description: `Credit note #${creditNote.id} applied to invoice #${p.invoiceId}`,
+      createdBy: userId,
+    });
+    entryIds.push(entryId);
+    await trx('edx_credit_note_applications').insert({
+      org_id: orgId, credit_note_id: creditNote.id,
+      target_booking_id: booking.id, target_invoice_id: p.invoiceId,
+      amount_applied: p.amount, status: 'APPLIED',
+      applied_by: userId, applied_at: now,
+      ledger_entry_id: entryId, notes: notes || null,
+    });
+  }
+
+  await trx('edx_credit_notes').where({ id: creditNote.id, org_id: orgId }).update({
+    remaining_amount: 0,
+    used_amount: round2((Number(creditNote.used_amount) || 0) + amount),
+    extended_status: 'FULLY_APPLIED',
+    transaction_entry_id: creditNote.transaction_entry_id || entryIds[0] || null,
+    updated_by: userId,
+    updated_on: now,
+  });
+  return { ok: true, amount, bookingId: booking.id, entryIds };
+}
+
 module.exports = {
   LEDGER_CREDIT_TYPES,
   LEDGER_DEBIT_TYPES,
   LEDGER_NET_CREDIT_SQL,
   createTransactionEntry,
+  postCreditNoteToBooking,
   outstandingBookingScope,
   billedAndPaid,
   computeOutstanding,

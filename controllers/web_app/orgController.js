@@ -16,6 +16,7 @@ const { generateOrgCode }    = require('../../utils/orgCode');
 const { invalidateOrgStatusCache } = require('../../middlewares/orgStatusGate');
 const withTransaction        = require('../../utils/withTransaction');
 const { getOrgId }           = require('../../utils/orgScope');
+const { ensureDefaultSupportCategories } = require('../../utils/supportCategories');
 
 function requireSuperadmin(req, res) {
   // Owner = is_owner JWT claim from /ownerLogin, never a tenant role.
@@ -138,6 +139,9 @@ const createOrganisation = async (req, res) => {
         activated_by: req.login_data.id,
         created_on:  getCurrentDateTime(),
       });
+
+      // Default support ticket types, so the org's ticket forms aren't empty
+      await ensureDefaultSupportCategories(trx, newOrgId);
 
       // Optionally create an admin user for the new org
       if (hashed) {

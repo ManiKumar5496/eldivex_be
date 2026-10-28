@@ -34,7 +34,6 @@ const {
   getRefunds,
   getRefundById,
   approveRefund,
-  applyCreditNote,
   getCreditNoteApplications,
   createInternalTransfer,
   getInternalTransfers,
@@ -1017,181 +1016,6 @@ describe('approveRefund', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// applyCreditNote
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe('applyCreditNote', () => {
-  const validBody = {
-    credit_note_id: 5,
-    target_booking_id: 10,
-    target_invoice_id: 20,
-    amount_to_apply: 100,
-  };
-  const approvedCn = {
-    id: 5,
-    amount: '500',
-    remaining_amount: '400',
-    used_amount: '100',
-    status: 'Approved',
-  };
-
-  test('returns 400 when required fields missing', async () => {
-    const res = mockRes();
-    await applyCreditNote(mockReq({ credit_note_id: 5 }), res);
-    expect(res.status).toHaveBeenCalledWith(400);
-  });
-
-  test('returns 400 when amount_to_apply is zero or negative', async () => {
-    for (const amt of [-50, '0', 'abc']) {
-      const res = mockRes();
-      await applyCreditNote(mockReq({ ...validBody, amount_to_apply: amt }), res);
-      expect(res.status).toHaveBeenCalledWith(400);
-    }
-    expect(db).not.toHaveBeenCalled();
-  });
-
-  test('returns 400 when the locked balance no longer covers the amount (race)', async () => {
-    db.mockReturnValueOnce(chain(approvedCn));
-    db.mockReturnValueOnce(chain({ id: 20 }));
-    db.mockReturnValueOnce(chain({ id: 10, user_id: 3 }));
-    const trxMock = jest.fn().mockImplementation(() => chain({ ...approvedCn, remaining_amount: '50' }));
-    trxMock.raw = jest.fn().mockReturnValue('RAW_EXPR');
-    withTransaction.mockImplementation(async (fn) => fn(trxMock));
-
-    const res = mockRes();
-    await applyCreditNote(mockReq(validBody), res);
-
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ error: expect.stringContaining('exceeds credit note') }));
-  });
-
-  test('returns 404 when credit note not found', async () => {
-    db.mockReturnValueOnce(chain(null));
-
-    const res = mockRes();
-    await applyCreditNote(mockReq(validBody), res);
-
-    expect(res.status).toHaveBeenCalledWith(404);
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ error: expect.stringContaining('Credit note') })
-    );
-  });
-
-  test('returns 400 when apply amount exceeds remaining', async () => {
-    const cn = { ...approvedCn, remaining_amount: '100' };
-    db.mockReturnValueOnce(chain(cn));
-
-    const res = mockRes();
-    // amount_to_apply=200 > remaining=100
-    await applyCreditNote(mockReq({ ...validBody, amount_to_apply: 200 }), res);
-
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ error: expect.stringContaining('exceeds credit note') })
-    );
-  });
-
-  test('returns 400 when credit note status is not Approved', async () => {
-    const cn = { ...approvedCn, status: 'Pending' };
-    db.mockReturnValueOnce(chain(cn));
-
-    const res = mockRes();
-    await applyCreditNote(mockReq(validBody), res);
-
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ error: expect.stringContaining('Approved') })
-    );
-  });
-
-  test('returns 404 when target invoice not found', async () => {
-    db.mockReturnValueOnce(chain(approvedCn));
-    db.mockReturnValueOnce(chain(null)); // invoice not found
-
-    const res = mockRes();
-    await applyCreditNote(mockReq(validBody), res);
-
-    expect(res.status).toHaveBeenCalledWith(404);
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ error: expect.stringContaining('invoice') })
-    );
-  });
-
-  test('returns 404 when target booking not found', async () => {
-    db.mockReturnValueOnce(chain(approvedCn));
-    db.mockReturnValueOnce(chain({ id: 20 })); // invoice found
-    db.mockReturnValueOnce(chain(null));         // booking not found
-
-    const res = mockRes();
-    await applyCreditNote(mockReq(validBody), res);
-
-    expect(res.status).toHaveBeenCalledWith(404);
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ error: expect.stringContaining('booking') })
-    );
-  });
-
-  test('applies credit note: updates remaining_amount and creates application record', async () => {
-    const targetBooking = { id: 10, user_id: 3 };
-    const application   = { id: 99, credit_note_id: 5, status: 'APPLIED', amount_applied: 100 };
-
-    // 1: credit note fetch
-    db.mockReturnValueOnce(chain(approvedCn));
-    // 2: invoice fetch
-    db.mockReturnValueOnce(chain({ id: 20 }));
-    // 3: booking fetch
-    db.mockReturnValueOnce(chain(targetBooking));
-
-    // trxMock: handles _createTransactionEntry (2 sum queries + 1 insert)
-    // + edx_credit_notes update + edx_credit_note_applications insert
-    const trxMock = jest.fn().mockImplementation((tableName) => {
-      if (tableName === 'edx_transaction_ledger') {
-        return chain({ total_debit: '0', total_credit: '0' });
-      }
-      if (tableName === 'edx_credit_notes') {
-        return chain(approvedCn); // locked re-read; update() resolves 1
-      }
-      if (tableName === 'edx_credit_note_applications') {
-        return chain([99]);
-      }
-      // Target invoice ₹1,000 with nothing paid → ₹1,000 open.
-      if (tableName === 'edx_invoice') {
-        return chain([{ id: 20, booking_id: 10, inv_start: '2026-01-01', inv_raised_amnt: '1000' }]);
-      }
-      if (tableName === 'edx_receipts') return chain([]);
-      return chain(null);
-    });
-    trxMock.raw = jest.fn().mockReturnValue('RAW_EXPR');
-
-    withTransaction.mockImplementation(async (fn) => { await fn(trxMock); });
-
-    // 4: fetch created application
-    db.mockReturnValueOnce(chain(application));
-
-    const res = mockRes();
-    await applyCreditNote(mockReq(validBody), res);
-
-    expect(withTransaction).toHaveBeenCalled();
-    expect(trxMock).toHaveBeenCalledWith('edx_credit_notes');
-    expect(trxMock).toHaveBeenCalledWith('edx_credit_note_applications');
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ status: 'APPLIED' })
-    );
-  });
-
-  test('returns 500 on db error', async () => {
-    const errChain = chain(null);
-    errChain.first = jest.fn().mockRejectedValue(new Error('DB fail'));
-    db.mockReturnValueOnce(errChain);
-
-    const res = mockRes();
-    await applyCreditNote(mockReq(validBody), res);
-
-    expect(res.status).toHaveBeenCalledWith(500);
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────────
 // getCreditNoteApplications
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1674,50 +1498,108 @@ describe('write-off approval re-checks the balance and always posts to the ledge
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// applyCreditNote: same client only, never past the invoice's open balance
+// updateCreditNoteStatus: approval applies the credit to its booking at once
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('applyCreditNote limits', () => {
-  const { applyCreditNote } = require('../../controllers/web_app/accountsController');
-  const body = { credit_note_id: 5, target_booking_id: 10, target_invoice_id: 20, amount_to_apply: 300 };
-  const cn = { id: 5, booking_id: 11, amount: '500', remaining_amount: '500', used_amount: '0', status: 'Approved' };
+describe('credit note approval applies the credit to its booking', () => {
+  const { updateCreditNoteStatus } = require('../../controllers/web_app/accountsController');
+  const pending = {
+    id: 1, booking_id: 8, invoice_id: 4, amount: '5000.00', remaining_amount: null,
+    used_amount: '0.00', status: 'Pending', created_by: 1,
+  };
 
-  test('refuses a credit note that belongs to a different client', async () => {
-    db.mockReturnValueOnce(chain(cn))                                   // credit note
-      .mockReturnValueOnce(chain({ id: 20, booking_id: 10 }))            // target invoice
-      .mockReturnValueOnce(chain({ id: 10, user_id: 3 }))                // target booking (client 3)
-      .mockReturnValueOnce(chain({ user_id: 4 }));                       // credit note's booking (client 4)
-
-    const res = mockRes();
-    await applyCreditNote(mockReq(body), res);
-
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(withTransaction).not.toHaveBeenCalled();
-  });
-
-  test('refuses more than the invoice still has open', async () => {
-    db.mockReturnValueOnce(chain(cn))
-      .mockReturnValueOnce(chain({ id: 20, booking_id: 10 }))
-      .mockReturnValueOnce(chain({ id: 10, user_id: 3 }))
-      .mockReturnValueOnce(chain({ user_id: 3 }));                       // same client
-
-    const appInsert = jest.fn().mockResolvedValue([1]);
+  // Transaction mock for booking 8 with `invoices` and per-invoice credit
+  // already applied; collects what gets written.
+  function trxFor({ invoices, credited = [] }) {
+    const written = { ledger: [], applications: [], noteUpdates: [] };
     const trx = jest.fn((table) => {
-      if (table === 'edx_credit_notes') return chain(cn);
-      // ₹1,000 invoice with ₹800 already received → ₹200 open; applying ₹300.
-      if (table === 'edx_invoice') return chain([{ id: 20, booking_id: 10, inv_start: '2026-01-01', inv_raised_amnt: '1000' }]);
-      if (table === 'edx_receipts') return chain([{ booking_id: 10, invoice_id: 20, total_amount: '800' }]);
-      if (table === 'edx_credit_note_applications') { const c = chain([]); c.insert = appInsert; return c; }
+      if (table === 'edx_credit_notes') {
+        const c = chain(pending);
+        c.update = jest.fn((row) => { written.noteUpdates.push(row); return Promise.resolve(1); });
+        return c;
+      }
+      if (table === 'edx_bookings') return chain({ id: 8, user_id: 5 });
+      if (table === 'edx_invoice') return chain(invoices);
+      if (table === 'edx_credit_note_applications') {
+        const c = chain(credited);
+        c.insert = jest.fn((row) => { written.applications.push(row); return Promise.resolve([1]); });
+        return c;
+      }
+      if (table === 'edx_transaction_ledger') {
+        const c = chain([]);
+        c.first = jest.fn().mockResolvedValue({ total_debit: '0', total_credit: '0' });
+        c.insert = jest.fn((row) => { written.ledger.push(row); return Promise.resolve([70 + written.ledger.length]); });
+        return c;
+      }
       return chain(null);
     });
     trx.raw = jest.fn().mockReturnValue('RAW_EXPR');
     withTransaction.mockImplementation(async (fn) => fn(trx));
+    return written;
+  }
+
+  test('credits the named invoice first, then the oldest, never past what each billed', async () => {
+    db.mockReturnValueOnce(chain(pending));
+    const written = trxFor({
+      invoices: [
+        { id: 3, inv_raised_amnt: '31000', inv_start: '2026-06-25' },
+        { id: 4, inv_raised_amnt: '34000', inv_start: '2026-10-28' },
+      ],
+      credited: [{ target_invoice_id: 4, total: '32000' }],   // invoice 4 has ₹2,000 left
+    });
 
     const res = mockRes();
-    await applyCreditNote(mockReq(body), res);
+    await updateCreditNoteStatus(mockReq({ id: 1, status: 'Approved' }), res);
+
+    expect(written.ledger).toEqual([
+      expect.objectContaining({ transaction_type: 'CREDIT_NOTE_APPLIED', direction: 'CREDIT', invoice_id: 4, amount: 2000, booking_id: 8 }),
+      expect.objectContaining({ transaction_type: 'CREDIT_NOTE_APPLIED', direction: 'CREDIT', invoice_id: 3, amount: 3000, booking_id: 8 }),
+    ]);
+    expect(written.applications.map((a) => [a.target_invoice_id, a.amount_applied])).toEqual([[4, 2000], [3, 3000]]);
+    expect(written.noteUpdates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ remaining_amount: 0, used_amount: 5000, extended_status: 'FULLY_APPLIED' }),
+      expect.objectContaining({ status: 'Approved' }),
+    ]));
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      message: 'Credit note approved. ₹5000.00 deducted from booking #8.',
+    }));
+  });
+
+  test('refuses, writing nothing, when the booking has no invoice yet', async () => {
+    db.mockReturnValueOnce(chain(pending));
+    const written = trxFor({ invoices: [] });
+
+    const res = mockRes();
+    await updateCreditNoteStatus(mockReq({ id: 1, status: 'Approved' }), res);
 
     expect(res.status).toHaveBeenCalledWith(400);
-    expect(appInsert).not.toHaveBeenCalled();
+    expect(written.ledger).toHaveLength(0);
+    expect(written.noteUpdates).toHaveLength(0);
+  });
+
+  test('refuses more than the booking can still be credited', async () => {
+    db.mockReturnValueOnce(chain(pending));
+    const written = trxFor({
+      invoices: [{ id: 4, inv_raised_amnt: '34000', inv_start: '2026-10-28' }],
+      credited: [{ target_invoice_id: 4, total: '31000' }],   // ₹3,000 left, note is ₹5,000
+    });
+
+    const res = mockRes();
+    await updateCreditNoteStatus(mockReq({ id: 1, status: 'Approved' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(written.ledger).toHaveLength(0);
+    expect(written.applications).toHaveLength(0);
+  });
+
+  test('the creator still cannot approve their own credit note', async () => {
+    db.mockReturnValueOnce(chain(pending));
+    const res = mockRes();
+    await updateCreditNoteStatus(
+      mockReq({ id: 1, status: 'Approved' }, {}, {}, { id: 1, org_id: 1 }), res);
+
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(withTransaction).not.toHaveBeenCalled();
   });
 });
 

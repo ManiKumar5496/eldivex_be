@@ -190,8 +190,45 @@ const getSupportStats = async (req, res) => {
   }
 };
 
+// GET /getSupportClient?user_id=N | ?booking_id=N — the client a ticket is
+// for, so the create form can show the name under User Id and fill User Id
+// from a Booking ID. Both lookups are limited to the caller's org.
+const getSupportClient = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const bookingId = parseInt(req.query.booking_id, 10);
+    let userId = parseInt(req.query.user_id, 10);
+
+    if (Number.isInteger(bookingId)) {
+      const booking = await db('edx_bookings')
+        .where({ id: bookingId, org_id: orgId })
+        .first('user_id');
+      if (!booking) return res.status(404).json({ message: 'Booking not found.' });
+      userId = booking.user_id;
+    } else if (!Number.isInteger(userId)) {
+      return res.status(400).json({ message: 'user_id or booking_id is required.' });
+    }
+
+    const client = await db('edx_client_app_users')
+      .where({ id: userId, org_id: orgId })
+      .first('id', 'user_name', 'phone_number');
+    if (!client) return res.status(404).json({ message: 'Client not found.' });
+
+    res.json({
+      booking_id:   Number.isInteger(bookingId) ? bookingId : null,
+      user_id:      client.id,
+      user_name:    client.user_name,
+      phone_number: client.phone_number,
+    });
+  } catch (error) {
+    logger.error(`[supportController] getSupportClient error: ${error.message}`);
+    res.status(500).json({ message: 'Failed to look up the client.' });
+  }
+};
+
 module.exports = guardOrgHandlers({
   createSupportTicket,
+  getSupportClient,
   getSupportTickets,
   getSupportCategory,
   getSupportStats,

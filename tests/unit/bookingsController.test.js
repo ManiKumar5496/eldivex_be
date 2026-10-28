@@ -129,6 +129,63 @@ function ownedRowsByDefault() {
   db.mockImplementation(() => chain({ id: 1, user_id: 3, br_id: 2, hp_reg_id: 7, final_rate: '100' }));
 }
 
+/**
+ * Knex-like transaction fake keyed by table name (aliases ignored). Per table:
+ * { rows, first, insertId, deleted } — rows / first may be functions of the
+ * writes so far. Inserts / updates / deletes are recorded on `trx.writes`.
+ */
+function fakeTables(config = {}) {
+  const writes = {};
+  const rec = (t) => (writes[t] = writes[t] || { inserts: [], updates: [], dels: 0 });
+  const trx = jest.fn((name) => {
+    const table = String(name).split(/\s+as\s+/i)[0];
+    const cfg = config[table] || {};
+    const val = (v) => (typeof v === 'function' ? v(writes) : v);
+    const q = {};
+    ['where', 'andWhere', 'whereIn', 'whereNotIn', 'whereRaw', 'whereNull', 'whereBetween', 'join',
+      'leftJoin', 'select', 'orderBy', 'groupBy', 'limit', 'sum', 'count', 'forUpdate']
+      .forEach((m) => { q[m] = jest.fn(() => q); });
+    q.first = jest.fn(() => Promise.resolve(
+      cfg.first !== undefined ? val(cfg.first) : ((val(cfg.rows) || [])[0] ?? null)));
+    q.insert = jest.fn((row) => { rec(table).inserts.push(row); return Promise.resolve([cfg.insertId ?? 1]); });
+    q.update = jest.fn((row) => { rec(table).updates.push(row); return Promise.resolve(1); });
+    q.del = jest.fn(() => { rec(table).dels += 1; return Promise.resolve(cfg.deleted ?? 0); });
+    q.then = (ok, fail) => Promise.resolve(val(cfg.rows) ?? []).then(ok, fail);
+    return q;
+  });
+  trx.raw = jest.fn(() => 'RAW_EXPR');
+  trx.writes = writes;
+  withTransaction.mockImplementation(async (fn) => fn(trx));
+  return trx;
+}
+
+// Ledger totals per type, built from the entries the code under test posted.
+const ledgerTotals = (w) => Object.values((w.edx_transaction_ledger?.inserts || []).reduce((acc, r) => {
+  acc[r.transaction_type] = acc[r.transaction_type]
+    || { transaction_type: r.transaction_type, direction: r.direction, total: 0 };
+  acc[r.transaction_type].total += r.amount;
+  return acc;
+}, {}));
+
+// One booking's money tables: `invoices` billed (₹ each), `paid` received.
+function bookingAccounts({ booking, invoices, paid = '0', holds = [], assignments = [], tickets = [] }) {
+  const billed = invoices.reduce((s, i) => s + Number(i.inv_raised_amnt), 0);
+  const raised = (w) => (w.edx_invoice?.inserts || []).reduce((s, r) => s + Number(r.inv_raised_amnt), 0);
+  return fakeTables({
+    edx_bookings: { first: booking },
+    edx_invoice: { rows: invoices, first: (w) => ({ total: String(billed + raised(w)) }) },
+    edx_receipts: { first: { total: paid } },
+    edx_refunds: { first: { total: '0' } },
+    edx_credit_notes: { first: { total: '0' }, insertId: 31 },
+    edx_credit_note_applications: { rows: [] },
+    edx_transaction_ledger: { first: { total_debit: '0', total_credit: '0' }, rows: ledgerTotals },
+    edx_hold_booking: { rows: holds, insertId: 41 },
+    edx_booking_hp: { rows: assignments },
+    edx_hp_attendance: { deleted: 2 },
+    edx_support_requests: { rows: tickets },
+  });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // createBooking
 // ─────────────────────────────────────────────────────────────────────────────
@@ -398,11 +455,16 @@ describe('updateHPBooking', () => {
     expect(updateMock).toHaveBeenCalledWith(expect.objectContaining({ hp_reg_status: 5 }));
   });
 
-  test('status=5: sets hp_reg_status to 1', async () => {
-    const updateMock = withHpRegUpdate(1);
+  test('status=5 (release): caregiver back to Approved (2) once no other booking holds them', async () => {
+    const hpRegUpdate = jest.fn().mockResolvedValue(1);
+    db.mockReturnValueOnce(chain(existingHp))                           // assignment lookup
+      .mockReturnValueOnce(chain(1))                                    // assignment → released
+      .mockReturnValueOnce(chain([]))                                   // their other open assignments
+      .mockReturnValueOnce({ ...chain(1), update: hpRegUpdate });       // registration status
     const res = mockRes();
     await updateHPBooking(mockReq({ booking_id: 10, hp_unique_id: 7, status: 5 }), res);
-    expect(updateMock).toHaveBeenCalledWith(expect.objectContaining({ hp_reg_status: 1 }));
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(hpRegUpdate).toHaveBeenCalledWith(expect.objectContaining({ hp_reg_status: 2 }));
   });
 
   test('responds 500 on DB error', async () => {
@@ -420,55 +482,88 @@ describe('updateHPBooking', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('holdBooking', () => {
-  function setupHoldTrx() {
-    const trx = jest.fn().mockReturnValue({
-      insert: jest.fn().mockResolvedValue([1]),
-      where:  jest.fn().mockReturnThis(),
-      update: jest.fn().mockResolvedValue(1),
-    });
-    withTransaction.mockImplementation(async (fn) => { await fn(trx); });
-    return trx;
-  }
+  // Started booking at ₹1,000/day, invoiced ₹90,000 for Jun 1 – Aug 29 and
+  // fully paid; one active caregiver; an open hold ticket.
+  const booking = {
+    id: 5, user_id: 3, status: '4', final_rate: '1000',
+    service_start_date: '2026-06-01', service_end_date: '2026-08-29',
+  };
+  const invoices = [{ id: 20, inv_raised_amnt: '90000', inv_start: '2026-06-01', inv_end: '2026-08-29' }];
+  const holdReq = { booking_id: 5, from_date: '2026-07-01', to_date: '2026-07-10', reason: 'Travelling' };
 
   beforeEach(ownedRowsByDefault);
+
+  test('responds 400 without valid hold dates', async () => {
+    const res = mockRes();
+    await holdBooking(mockReq({ booking_id: 5, from_date: '2026-07-10', to_date: '2026-07-01' }), res);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(withTransaction).not.toHaveBeenCalled();
+  });
 
   test('responds 404 when the booking is not in the caller org', async () => {
     db.mockReturnValueOnce(chain(null));
     const res = mockRes();
-    await holdBooking(mockReq({ booking_id: 5, from_date: '2026-07-01', to_date: '2026-07-10' }), res);
+    await holdBooking(mockReq(holdReq), res);
     expect(res.status).toHaveBeenCalledWith(404);
     expect(withTransaction).not.toHaveBeenCalled();
   });
 
-  test('responds 201 on success', async () => {
-    setupHoldTrx();
+  test('holds the booking, releases its caregiver, clears attendance and credits the billed hold days', async () => {
+    const trx = bookingAccounts({
+      booking, invoices, paid: '90000',
+      assignments: [{ id: 1, hp_unique_id: 7, status: 4 }],
+      tickets: [{ id: 9 }],
+    });
     const res = mockRes();
-    await holdBooking(
-      mockReq({ booking_id: 5, from_date: '2026-07-01', to_date: '2026-07-10', reason: 'Vacation' }),
-      res
-    );
+    await holdBooking(mockReq(holdReq), res);
+
     expect(res.status).toHaveBeenCalledWith(201);
-    expect(res.json).toHaveBeenCalledWith(
-      expect.objectContaining({ message: 'Hold Booking created successfully.' })
-    );
+    const w = trx.writes;
+    expect(w.edx_hold_booking.inserts[0]).toEqual(expect.objectContaining({ from_date: '2026-07-01', to_date: '2026-07-10' }));
+    expect(w.edx_bookings.updates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ status: '5', hold_start_date: '2026-07-01', hold_end_date: '2026-07-10' }),
+    ]));
+    // Caregiver released with the day before the hold as their last day.
+    expect(w.edx_booking_hp.updates).toEqual([expect.objectContaining({ status: 5, end_date_actual: '2026-06-30' })]);
+    expect(w.edx_hp_attendance.dels).toBe(1);
+    // 10 billed hold days × ₹1,000, approved and applied at once.
+    expect(w.edx_credit_notes.inserts).toEqual([
+      expect.objectContaining({ credit_type: 'Hold', status: 'Approved', amount: 10000 }),
+    ]);
+    expect(w.edx_transaction_ledger.inserts).toEqual([
+      expect.objectContaining({ transaction_type: 'CREDIT_NOTE_APPLIED', amount: 10000 }),
+    ]);
+    expect(w.edx_support_requests.updates).toEqual([expect.objectContaining({ status: 3 })]);
+
+    const { hold_summary: s } = res.json.mock.calls[0][0];
+    expect(s).toEqual(expect.objectContaining({
+      hold_days: 10, billed_hold_days: 10, credit_amount: 10000,
+      released_caregivers: 1, attendance_removed: 2, excess: 10000, owing: 0,
+    }));
   });
 
-  test('inserts into edx_hold_booking and updates edx_bookings status to 5', async () => {
-    const trx = setupHoldTrx();
+  test('only credits hold days that were invoiced', async () => {
+    // Invoiced only up to Jul 5 → 5 of the 10 hold days were billed.
+    const trx = bookingAccounts({
+      booking, invoices: [{ id: 20, inv_raised_amnt: '35000', inv_start: '2026-06-01', inv_end: '2026-07-05' }],
+    });
     const res = mockRes();
-    await holdBooking(mockReq({ booking_id: 5, from_date: '2026-07-01', to_date: '2026-07-10' }), res);
-    expect(trx).toHaveBeenCalledWith('edx_hold_booking');
-    expect(trx).toHaveBeenCalledWith('edx_bookings');
-    const bookingCall = trx.mock.results[trx.mock.calls.findIndex(([t]) => t === 'edx_bookings')];
-    expect(bookingCall.value.update).toHaveBeenCalledWith(
-      expect.objectContaining({ status: '5' })
-    );
+    await holdBooking(mockReq(holdReq), res);
+    expect(trx.writes.edx_credit_notes.inserts).toEqual([expect.objectContaining({ amount: 5000 })]);
+  });
+
+  test('responds 409 when the booking is already on hold', async () => {
+    const trx = bookingAccounts({ booking: { ...booking, status: '5' }, invoices });
+    const res = mockRes();
+    await holdBooking(mockReq(holdReq), res);
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(trx.writes.edx_hold_booking).toBeUndefined();
   });
 
   test('responds 500 when transaction throws', async () => {
     withTransaction.mockRejectedValue(new Error('Trx fail'));
     const res = mockRes();
-    await holdBooking(mockReq({ booking_id: 5 }), res);
+    await holdBooking(mockReq(holdReq), res);
     expect(res.status).toHaveBeenCalledWith(500);
   });
 });
@@ -560,6 +655,8 @@ const validAtt = {
 describe('markAttendance', () => {
   test('responds 201 on success (booking exists → upsert)', async () => {
     db.mockReturnValueOnce(chain({ id: 5 }))  // booking lookup
+      .mockReturnValueOnce(chain([]))          // not cancelled
+      .mockReturnValueOnce(chain([]))          // no holds
       .mockReturnValueOnce(upsertChain());     // upsert
     const res = mockRes();
     await markAttendance(mockReq({ ...validAtt }), res);
@@ -588,10 +685,34 @@ describe('markAttendance', () => {
     expect(res.status).toHaveBeenCalledWith(400);
   });
 
+  test('refuses a day inside a hold', async () => {
+    const upsert = upsertChain();
+    db.mockReturnValueOnce(chain({ id: 5 }))
+      .mockReturnValueOnce(chain([]))
+      .mockReturnValueOnce(chain([{ booking_id: 5, from_date: '2026-05-28', to_date: '2026-06-05' }]))
+      .mockReturnValueOnce(upsert);
+    const res = mockRes();
+    await markAttendance(mockReq({ ...validAtt }), res);   // 2026-06-01
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith({ message: 'Booking #5 is on hold from 2026-05-28 to 2026-06-05.' });
+    expect(upsert.insert).not.toHaveBeenCalled();
+  });
+
+  test('refuses a day after a cancelled booking\'s last service day', async () => {
+    db.mockReturnValueOnce(chain({ id: 5 }))
+      .mockReturnValueOnce(chain([{ id: 5, term_date: '2026-05-31' }]))
+      .mockReturnValueOnce(chain([]));
+    const res = mockRes();
+    await markAttendance(mockReq({ ...validAtt }), res);
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
   test('responds 500 on DB error', async () => {
     const bad = upsertChain();
     bad.merge = jest.fn().mockRejectedValue(new Error('DB fail'));
     db.mockReturnValueOnce(chain({ id: 5 })) // booking exists
+      .mockReturnValueOnce(chain([]))         // not cancelled
+      .mockReturnValueOnce(chain([]))         // no holds
       .mockReturnValueOnce(bad);              // upsert fails
     const res = mockRes();
     await markAttendance(mockReq({ ...validAtt }), res);
@@ -607,7 +728,9 @@ describe('markAttendanceBatch', () => {
   });
 
   test('upserts valid records and reports failures', async () => {
-    db.mockReturnValueOnce(chain([{ id: 5 }])); // booking existence lookup
+    db.mockReturnValueOnce(chain([{ id: 5 }]))  // booking existence lookup
+      .mockReturnValueOnce(chain([]))           // not cancelled
+      .mockReturnValueOnce(chain([]));          // no holds
     const trxFn = jest.fn(() => upsertChain());
     withTransaction.mockImplementation(async (cb) => cb(trxFn));
 
@@ -639,23 +762,10 @@ describe('cancelUserService', () => {
     service_start_date: '2026-06-01', service_end_date: '2026-08-29',
   };
 
-  // Transaction mock: the locked booking row, ₹billed invoiced and ₹paid
-  // received so far; one chain per trx() call, recorded per table.
-  function setupCancelTrx({ booking = startedBooking, billed = '0', paid = '0' } = {}) {
-    const calls = {};
-    const trx = jest.fn((table) => {
-      let c;
-      if (table === 'edx_bookings') c = chain(booking);
-      else if (table === 'edx_invoice') c = chain({ total: billed });
-      else if (table === 'edx_receipts') c = chain({ total: paid });
-      else c = chain({ total: '0' });
-      (calls[table] = calls[table] || []).push(c);
-      return c;
-    });
-    trx.calls = calls;
-    withTransaction.mockImplementation(async (fn) => fn(trx));
-    return trx;
-  }
+  // Invoiced ₹90,000 up front for the 90 days.
+  const upFront = [{ id: 20, inv_raised_amnt: '90000', inv_start: '2026-06-01', inv_end: '2026-08-29' }];
+  const setupCancelTrx = (opts = {}) =>
+    bookingAccounts({ booking: startedBooking, invoices: [], ...opts });
 
   beforeEach(ownedRowsByDefault);
 
@@ -680,38 +790,72 @@ describe('cancelUserService', () => {
     );
   });
 
-  test('inserts into edx_service_closed and sets booking status to 6', async () => {
+  test('inserts into edx_service_closed and sets a started booking to 6', async () => {
     const trx = setupCancelTrx();
-    const res = mockRes();
-    await cancelUserService(mockReq({ booking_id: 5 }), res);
-    expect(trx).toHaveBeenCalledWith('edx_service_closed');
-    const updated = trx.calls.edx_bookings.some((c) => c.update.mock.calls.some(
-      ([row]) => row && row.status === '6'));
-    expect(updated).toBe(true);
+    await cancelUserService(mockReq({ booking_id: 5, term_date: '2026-06-10' }), mockRes());
+    expect(trx.writes.edx_service_closed.inserts).toEqual([expect.objectContaining({ term_date: '2026-06-10' })]);
+    expect(trx.writes.edx_bookings.updates).toEqual([expect.objectContaining({ status: '6' })]);
   });
 
-  test('credits unused billed days instead of invoicing them again', async () => {
-    // Invoiced ₹90,000 up front for 90 days; cancelled after 10 days used.
-    const trx = setupCancelTrx({ billed: '90000', paid: '0' });
+  test('a booking whose service never started becomes Booking Cancelled (3)', async () => {
+    const trx = setupCancelTrx({ booking: { ...startedBooking, status: '2' } });
+    await cancelUserService(mockReq({ booking_id: 5, term_date: '2026-06-10' }), mockRes());
+    expect(trx.writes.edx_bookings.updates).toEqual([expect.objectContaining({ status: '3' })]);
+  });
+
+  test('credits unused billed days at once, releases caregivers, clears attendance, reports the excess', async () => {
+    // 10 days used of 90 invoiced; ₹50,000 paid → ₹80,000 credit, ₹40,000 excess.
+    const trx = setupCancelTrx({
+      invoices: upFront, paid: '50000',
+      assignments: [{ id: 1, hp_unique_id: 7, status: 4 }, { id: 2, hp_unique_id: 8, status: 1 }],
+      tickets: [{ id: 9 }],
+    });
     const res = mockRes();
     await cancelUserService(mockReq({ booking_id: 5, term_date: '2026-06-10' }), res);
 
     expect(res.status).toHaveBeenCalledWith(201);
-    const notes = trx.calls.edx_credit_notes.flatMap((c) => c.insert.mock.calls.map(([row]) => row));
-    expect(notes).toEqual([
-      expect.objectContaining({ credit_type: 'Cancellation', amount: 80000, status: 'Pending' }),
+    const w = trx.writes;
+    expect(w.edx_credit_notes.inserts).toEqual([
+      expect.objectContaining({ credit_type: 'Cancellation', amount: 80000, status: 'Approved' }),
     ]);
-    const invoiced = (trx.calls.edx_invoice || []).some((c) => c.insert.mock.calls.length > 0);
-    expect(invoiced).toBe(false);
+    expect(w.edx_transaction_ledger.inserts).toEqual([
+      expect.objectContaining({ transaction_type: 'CREDIT_NOTE_APPLIED', amount: 80000, invoice_id: 20 }),
+    ]);
+    expect(w.edx_invoice).toBeUndefined();
+    // Active caregiver ends on the last service day; the shortlisted one is released too.
+    expect(w.edx_booking_hp.updates).toEqual([
+      expect.objectContaining({ status: 5, end_date_actual: '2026-06-10' }),
+      expect.objectContaining({ status: 5 }),
+    ]);
+    expect(w.edx_hp_attendance.dels).toBe(1);
+    expect(w.edx_support_requests.updates).toEqual([expect.objectContaining({ status: 3 })]);
+
+    const { billing_summary: s } = res.json.mock.calls[0][0];
+    expect(s).toEqual(expect.objectContaining({
+      days_used: 10, credit_note_amount: 80000, released_caregivers: 2,
+      attendance_removed: 2, tickets_resolved: 1, refundable: 40000, excess: 40000, owing: 0,
+    }));
   });
 
-  test('invoices only the used days not yet billed', async () => {
-    // Nothing invoiced yet; 10 days used → one ₹10,000 invoice.
-    const trx = setupCancelTrx({ billed: '0' });
+  test('does not credit again billed days a hold already credited', async () => {
+    // A 10-day hold in July was credited; cancelling on Jun 10 → 90k − 10k − 10k.
+    const trx = setupCancelTrx({
+      invoices: upFront, holds: [{ from_date: '2026-07-01', to_date: '2026-07-10' }],
+    });
     await cancelUserService(mockReq({ booking_id: 5, term_date: '2026-06-10' }), mockRes());
+    expect(trx.writes.edx_credit_notes.inserts).toEqual([expect.objectContaining({ amount: 70000 })]);
+  });
 
-    const inserts = trx.calls.edx_invoice.flatMap((c) => c.insert.mock.calls.map(([row]) => row));
-    expect(inserts).toEqual([expect.objectContaining({ inv_raised_amnt: 10000 })]);
+  test('invoices only the used days not yet billed and leaves them owing', async () => {
+    // Nothing invoiced yet; 10 days used → one ₹10,000 invoice, still owed.
+    const trx = setupCancelTrx();
+    const res = mockRes();
+    await cancelUserService(mockReq({ booking_id: 5, term_date: '2026-06-10' }), res);
+
+    expect(trx.writes.edx_invoice.inserts).toEqual([expect.objectContaining({ inv_raised_amnt: 10000 })]);
+    expect(trx.writes.edx_credit_notes).toBeUndefined();
+    expect(res.json.mock.calls[0][0].billing_summary).toEqual(
+      expect.objectContaining({ owing: 10000, refundable: 0 }));
   });
 
   test('responds 409 when the booking is already cancelled', async () => {
@@ -720,7 +864,7 @@ describe('cancelUserService', () => {
     await cancelUserService(mockReq({ booking_id: 5, term_date: '2026-06-10' }), res);
 
     expect(res.status).toHaveBeenCalledWith(409);
-    expect(trx).not.toHaveBeenCalledWith('edx_service_closed');
+    expect(trx.writes.edx_service_closed).toBeUndefined();
   });
 
   test('responds 500 on transaction error', async () => {

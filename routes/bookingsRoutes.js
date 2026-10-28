@@ -34,5 +34,6 @@ router.get('/getBookingOTP',       bookingOtp, bookingsController.getBookingOTP)
 router.get('/getHPByBooking',      bookingsHp, bookingsController.getHPByBooking);
 router.get('/matchHP',             bookingsHp, bookingsController.getMatchedHPs);   // Phase 4.4
 router.get('/getAttendanceList',   bookingsHp, bookingsController.getAttendanceList);
+router.get('/getBookingOpenTickets', bookings, bookingsController.getBookingOpenTickets);
 
 module.exports = router;

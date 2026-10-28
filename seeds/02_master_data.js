@@ -5,6 +5,8 @@
  * edx_support_category.app_type / status (migration 028 — run migrations first).
  */
 
+const { DEFAULT_SUPPORT_CATEGORIES } = require('../utils/supportCategories');
+
 const ORG_ID = 1;
 
 exports.seed = async function (knex) {
@@ -63,19 +65,7 @@ exports.seed = async function (knex) {
   }
 
   // ── 3. Support ticket categories ───────────────────────────────────────────
-  const supportCategories = [
-    { name: 'Billing Issue',        app_type: 'web' },
-    { name: 'Service Hold',         app_type: 'web' },
-    { name: 'Service Cancellation', app_type: 'web' },
-    { name: 'Caregiver Replacement',app_type: 'web' },
-    { name: 'General Inquiry',      app_type: 'web' },
-    { name: 'Booking Help',         app_type: 'client' },
-    { name: 'Payment Issue',        app_type: 'client' },
-    { name: 'Payout Issue',         app_type: 'hp' },
-    { name: 'Attendance Issue',     app_type: 'hp' },
-  ];
-
-  for (const cat of supportCategories) {
+  for (const cat of DEFAULT_SUPPORT_CATEGORIES) {
     const existing = await knex('edx_support_category').where({ name: cat.name, org_id: ORG_ID }).first();
     if (!existing) {
       const [id] = await knex('edx_support_category').insert({ ...cat, status: 1, org_id: ORG_ID });

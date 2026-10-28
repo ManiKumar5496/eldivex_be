@@ -69,7 +69,6 @@ router.post('/createRefund',                   billing, ac.createRefund);
 router.get('/getRefunds',                      billing, ac.getRefunds);
 router.get('/getRefundById/:id',               billing, ac.getRefundById);
 router.patch('/approveRefund',                 billing, ac.approveRefund);
-router.post('/applyCreditNote',                billing, ac.applyCreditNote);
 router.get('/getCreditNoteApplications',       billing, ac.getCreditNoteApplications);
 router.post('/createInternalTransfer',         billing, ac.createInternalTransfer);
 router.get('/getInternalTransfers',            billing, ac.getInternalTransfers);

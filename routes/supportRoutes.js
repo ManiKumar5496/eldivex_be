@@ -17,6 +17,7 @@ const support = [auth, requireStaff, requireModule('Support Ticket', 'Bookings')
 
 router.post('/createSupportTicket', support, validate(createSupportTicketSchema), supportController.createSupportTicket);
 router.get('/getSupportTickets',    support, supportController.getSupportTickets);
+router.get('/getSupportClient',     support, supportController.getSupportClient);
 router.get('/getSupportCategory',   supportController.getSupportCategory);  // public — used in forms before login
 router.get('/getSupportStats',      support, supportController.getSupportStats);
 

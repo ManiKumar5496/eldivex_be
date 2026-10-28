@@ -21,6 +21,7 @@ const {
   LEDGER_NET_CREDIT_SQL,
   createTransactionEntry: _createTransactionEntry,
   computeOutstanding: _computeOutstanding,
+  postCreditNoteToBooking: _postCreditNoteToBooking,
 } = require('../../utils/accountsLedger');
 const { bookingStatusLabel } = require('../../utils/bookingStatus');
 const withTransaction = require('../../utils/withTransaction');
@@ -833,6 +834,33 @@ const updateCreditNoteStatus = async (req, res) => {
       return res.status(403).json(errBody('You cannot approve a credit note you created.'));
     }
 
+    // Approval applies the credit to its booking in the same transaction, so
+    // the outstanding drops at once; any excess over what the client owes is
+    // then refundable or transferable to another booking.
+    if (status === 'Approved') {
+      const orgId = getOrgId(req);
+      const userId = req.login_data.id;
+      const posted = await withTransaction(async (trx) => {
+        const locked = await trx('edx_credit_notes').where({ id, org_id: orgId }).forUpdate().first();
+        if (!locked || locked.status !== 'Pending') throw new StateConflict('Credit note was already processed.');
+        const result = await _postCreditNoteToBooking(trx, {
+          orgId, userId, creditNote: locked, notes: 'Applied on approval',
+        });
+        if (!result.ok) {
+          throw new StateConflict(result.invoiceCount === 0
+            ? `Booking #${locked.booking_id} has no invoice yet. Raise the invoice, then approve this credit note.`
+            : `Credit note ₹${fmt2(locked.amount)} is more than booking #${locked.booking_id} can still be credited (₹${fmt2(result.creditable)}).`,
+          400);
+        }
+        await trx('edx_credit_notes').where({ id, org_id: orgId })
+          .update({ status: 'Approved', updated_by: userId, updated_on: getCurrentDateTime() });
+        return result;
+      });
+      return res.json({
+        message: `Credit note approved. ₹${fmt2(posted.amount)} deducted from booking #${posted.bookingId}.`,
+      });
+    }
+
     const updated = await db('edx_credit_notes')
       .where({ id, status: 'Pending' })
       .andWhere('org_id', getOrgId(req))
@@ -840,6 +868,7 @@ const updateCreditNoteStatus = async (req, res) => {
     if (!updated) return res.status(409).json(errBody('Credit note was already processed.'));
     res.json({ message: `Credit note ${status.toLowerCase()}.` });
   } catch (err) {
+    if (err instanceof StateConflict) return res.status(err.status).json(errBody(err.message));
     logger.error(`Error updateCreditNoteStatus: ${err.message}`);
     res.status(500).json(errBody('An error occurred.'));
   }
@@ -2398,96 +2427,6 @@ const approveRefund = async (req, res) => {
   }
 };
 
-// ── applyCreditNote ──────────────────────────────────────────────────────────
-
-const applyCreditNote = async (req, res) => {
-  try {
-    const orgId = getOrgId(req);
-    const userId = req.login_data.id;
-    const { credit_note_id, target_booking_id, target_invoice_id, amount_to_apply, notes } = req.body;
-    if (!credit_note_id || !target_booking_id || !target_invoice_id || !amount_to_apply) {
-      return res.status(400).json(errBody('credit_note_id, target_booking_id, target_invoice_id, amount_to_apply required'));
-    }
-    const applyAmt = parseFloat(amount_to_apply);
-    if (!Number.isFinite(applyAmt) || applyAmt <= 0) {
-      return res.status(400).json(errBody('amount_to_apply must be greater than zero'));
-    }
-    const cn = await db('edx_credit_notes').where({ id: credit_note_id, org_id: orgId }).first();
-    if (!cn) return res.status(404).json(errBody('Credit note not found'));
-    const remaining = parseFloat(cn.remaining_amount ?? cn.amount);
-    if (remaining < applyAmt) return res.status(400).json(errBody('Amount exceeds credit note remaining balance of ' + remaining));
-    if (!['Approved'].includes(cn.status)) return res.status(400).json(errBody('Credit note must be Approved to apply'));
-
-    const invoice = await db('edx_invoice').where({ id: target_invoice_id, org_id: orgId }).first();
-    if (!invoice) return res.status(404).json(errBody('Target invoice not found'));
-    if (invoice.booking_id != null && String(invoice.booking_id) !== String(target_booking_id)) {
-      return res.status(400).json(errBody('Target invoice does not belong to the target booking'));
-    }
-
-    const targetBooking = await db('edx_bookings').where({ id: target_booking_id, org_id: orgId }).first();
-    if (!targetBooking) return res.status(404).json(errBody('Target booking not found'));
-
-    // A client's credit can only settle that same client's invoices.
-    if (cn.booking_id != null) {
-      const cnBooking = await db('edx_bookings').where({ id: cn.booking_id, org_id: orgId }).first('user_id');
-      if (cnBooking && String(cnBooking.user_id) !== String(targetBooking.user_id)) {
-        return res.status(400).json(errBody('The credit note belongs to a different client'));
-      }
-    }
-
-    let applicationId;
-    await withTransaction(async (trx) => {
-      // Balance is re-read under a row lock: two concurrent applications must
-      // not both spend the same remaining amount.
-      const locked = await trx('edx_credit_notes').where({ id: credit_note_id, org_id: orgId }).forUpdate().first();
-      if (!locked || locked.status !== 'Approved') throw new StateConflict('Credit note must be Approved to apply', 400);
-      const lockedRemaining = parseFloat(locked.remaining_amount ?? locked.amount);
-      if (!(lockedRemaining >= applyAmt)) {
-        throw new StateConflict('Amount exceeds credit note remaining balance of ' + lockedRemaining, 400);
-      }
-
-      // Never credit an invoice past what is still open on it (after its
-      // receipts and earlier credit-note applications).
-      await trx('edx_invoice').where({ id: target_invoice_id }).forUpdate().first('id');
-      const alloc = await _invoiceAllocations(trx, [targetBooking.id]);
-      const open = alloc.get(String(target_invoice_id))?.balance ?? 0;
-      if (applyAmt > open + MONEY_EPS) {
-        throw new StateConflict(`Amount exceeds the invoice's open balance of ₹${fmt2(Math.max(0, open))}`, 400);
-      }
-      const newRemaining = lockedRemaining - applyAmt;
-      const newUsed = (parseFloat(locked.used_amount) || 0) + applyAmt;
-      const extStatus = newRemaining <= 0 ? 'FULLY_APPLIED' : 'PARTIALLY_APPLIED';
-      await trx('edx_credit_notes').where({ id: credit_note_id, org_id: orgId }).update({
-        remaining_amount: newRemaining, used_amount: newUsed, extended_status: extStatus,
-        updated_on: getCurrentDateTime(), updated_by: userId,
-      });
-
-      const entryId = await _createTransactionEntry(trx, {
-        orgId, clientId: targetBooking.user_id, bookingId: target_booking_id,
-        invoiceId: target_invoice_id, transactionType: 'CREDIT_NOTE_APPLIED', direction: 'CREDIT',
-        amount: applyAmt, referenceId: credit_note_id, referenceType: 'CREDIT_NOTE',
-        description: 'Credit note applied to invoice #' + target_invoice_id,
-        createdBy: userId,
-      });
-
-      const [appId] = await trx('edx_credit_note_applications').insert({
-        org_id: orgId, credit_note_id, target_booking_id, target_invoice_id,
-        amount_applied: applyAmt, status: 'APPLIED',
-        applied_by: userId, applied_at: getCurrentDateTime(),
-        ledger_entry_id: entryId, notes: notes || null,
-      });
-      applicationId = appId;
-    });
-
-    const application = await db('edx_credit_note_applications').where('id', applicationId).first();
-    return res.json(application);
-  } catch (err) {
-    if (err instanceof StateConflict) return res.status(err.status).json(errBody(err.message));
-    logger.error(`applyCreditNote error: ${err.message}`);
-    return res.status(500).json(errBody('Failed to apply credit note'));
-  }
-};
-
 // ── getCreditNoteApplications ────────────────────────────────────────────────
 
 const getCreditNoteApplications = async (req, res) => {
@@ -2737,7 +2676,6 @@ module.exports = guardOrgHandlers({
   getRefunds,
   getRefundById,
   approveRefund,
-  applyCreditNote,
   getCreditNoteApplications,
   createInternalTransfer,
   getInternalTransfers,

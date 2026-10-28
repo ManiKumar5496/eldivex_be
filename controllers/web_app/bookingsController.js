@@ -14,51 +14,15 @@ const { notifyOrgAdmins } = require('../../utils/notify');
 const { getClientContact } = require('../../utils/clientContact');
 const { checkPlanLimit } = require('../../utils/planUsage');
 const { ENGAGED_BOOKING_STATUSES } = require('../../utils/bookingStatus');
-const { computeCancellationSettlement, parseLocalDate, formatLocalDate } = require('../../utils/accountsCalc');
+const {
+  computeCancellationSettlement, parseLocalDate, formatLocalDate, addDays, daysInclusive, SERVICE_STARTED_STATUSES,
+} = require('../../utils/accountsCalc');
+const {
+  refreshHpRegStatus, releaseBookingCaregivers, clearAttendance, loadAttendanceBlocks, attendanceBlockReason,
+  invoicedDaysIn, heldCreditAfter, applySystemCreditNote, resolveOpenTickets, accountPosition,
+} = require('../../utils/bookingLifecycle');
 const { guardOrgHandlers } = require('../../utils/requestOrg');
 const crypto = require('crypto');
-
-// ── Accounts event helpers ────────────────────────────────────────────────────
-
-/**
- * Auto-create a credit note when a booking is put on hold.
- * Credit = hold_days × daily_rate (preliminary — confirmed when hold is lifted).
- */
-async function _createHoldCreditNote({ booking_id, from_date, to_date, inv_id, org_id, created_by }) {
-  try {
-    if (org_id == null) return;
-    const booking = await db('edx_bookings').where({ id: booking_id, org_id }).first();
-    if (!booking) return;
-
-    const finalRate = parseFloat(booking.final_rate) || 0;
-    let holdDays = 0;
-    if (from_date && to_date) {
-      const s = new Date(from_date);
-      const e = new Date(to_date);
-      holdDays = s <= e ? Math.ceil((e - s) / (1000 * 60 * 60 * 24)) + 1 : 0;
-    }
-    const creditAmount = holdDays * finalRate;
-    if (creditAmount <= 0) return;
-
-    await db('edx_credit_notes').insert({
-      booking_id,
-      invoice_id:  inv_id    || null,
-      credit_type: 'Hold',
-      amount:      creditAmount,
-      reason:      `Service on hold from ${from_date} to ${to_date} (${holdDays} day(s) × ₹${finalRate}/day)`,
-      status:      'Pending',
-      credit_date: from_date || getCurrentDateTime(),
-      org_id,
-      created_by,
-      created_on:  getCurrentDateTime(),
-    });
-
-    // Log rate history if rate changed recently (no-op here, but hook is in place)
-    logger.info(`[accounts] Hold credit note created for booking #${booking_id} — ₹${creditAmount}`);
-  } catch (err) {
-    logger.warn(`[accounts] _createHoldCreditNote failed: ${err.message}`);
-  }
-}
 
 /**
  * Log a rate change to edx_rate_history when booking rates are updated.
@@ -571,25 +535,23 @@ else if (status == 4) {
         updated_by:req.login_data?.id || null
       });
 }
-else if (status == 5) {
-  await db('edx_hp_registration')
-      .where({ hp_reg_id: hp_unique_id })
-      .where('org_id', getOrgId(req))
-      .update({
-        hp_reg_status:1,
-        updated_on:db.fn.now(),
-        updated_by:req.login_data?.id || null
-      });
-}
       // audit fields
       updatePayload.updated_on = getCurrentDateTime();
       updatePayload.updated_by = req.login_data?.id || null;
-  
+
       // 3️⃣ perform update
       if (Object.keys(updatePayload).length > 0) {
         await db('edx_booking_hp')
           .where({ bkng_id: bookingId, hp_unique_id: hp_unique_id, org_id: getOrgId(req) })
           .update(updatePayload);
+      }
+
+      // Released (5): back to Approved so matching offers the caregiver again,
+      // unless they still hold another booking. Read after the update above.
+      if (status == 5) {
+        await refreshHpRegStatus(db, {
+          orgId: getOrgId(req), hpIds: [hp_unique_id], userId: req.login_data?.id,
+        });
       }
 
       res.status(200).json({
@@ -603,46 +565,100 @@ else if (status == 5) {
       res.status(500).json({ message: "Error update Booking HP." });
     }
   };
+  /**
+   * POST /holdBooking { booking_id, from_date, to_date, reason }
+   *
+   * Puts the booking on hold in one transaction: records the hold, sets status
+   * On Hold with the hold dates, releases its caregivers (last day = the day
+   * before the hold), removes attendance marked inside the hold, credits the
+   * hold days that were already invoiced (applied at once), and resolves the
+   * open hold ticket. Returns hold_summary with where the account stands.
+   */
   const holdBooking = async (req, res) => {
     try {
-      const {
-        booking_id,
-        inv_id,
-        from_date,
-        to_date,
-        reason,
-        hp_id,
-      
-        
-      } = req.body;
+      const { booking_id, from_date, to_date, reason } = req.body;
       const userId = req.login_data.id;
       const orgId = getOrgId(req);
 
-      const holdTarget = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first('id', 'user_id', 'final_rate');
+      const from = parseLocalDate(from_date);
+      const to = parseLocalDate(to_date);
+      if (!booking_id || !from || !to) {
+        return res.status(400).json({ message: 'booking_id, from_date and to_date (YYYY-MM-DD) are required.' });
+      }
+      if (to < from) return res.status(400).json({ message: 'to_date must be on or after from_date.' });
+      const fromStr = formatLocalDate(from);
+      const toStr = formatLocalDate(to);
+
+      const holdTarget = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first('id', 'user_id');
       if (!holdTarget) return res.status(404).json({ message: 'Booking not found.' });
 
-      await withTransaction(async (trx) => {
-        await trx('edx_hold_booking').insert(withOrg(req, {
-          booking_id: booking_id || 'NA',
-          inv_id: inv_id || 'NA',
-          from_date: from_date || 'NA',
-          to_date: to_date || 'NA',
-          reason: reason || 'NA',
-          hp_id: hp_id || 'NA',
-          created_on: getCurrentDateTime(),
-          created_by: userId
-        }));
+      let summary;
+      try {
+        summary = await withTransaction(async (trx) => {
+          const booking = await trx('edx_bookings').where({ id: booking_id, org_id: orgId }).forUpdate().first();
+          if (!booking || ['3', '6'].includes(String(booking.status))) {
+            throw Object.assign(new Error('Booking is cancelled.'), { status: 409 });
+          }
+          if (String(booking.status) === '5') {
+            throw Object.assign(new Error('Booking is already on hold.'), { status: 409 });
+          }
 
-        await trx('edx_bookings')
-          .where({ id: booking_id, org_id: getOrgId(req) })
-          .update({
+          const [holdId] = await trx('edx_hold_booking').insert(withOrg(req, {
+            booking_id,
+            from_date: fromStr,
+            to_date: toStr,
+            reason: reason || 'NA',
+            created_on: getCurrentDateTime(),
+            created_by: userId,
+          }));
+          await trx('edx_bookings').where({ id: booking_id, org_id: orgId }).update({
             status: '5',
-            updated_on: db.fn.now(),
-            updated_by: userId
+            hold_start_date: fromStr,
+            hold_end_date: toStr,
+            updated_on: getCurrentDateTime(),
+            updated_by: userId,
           });
-      });
 
-      res.status(201).json({ message: 'Hold Booking created successfully.' });
+          const released = await releaseBookingCaregivers(trx, {
+            orgId, bookingId: booking_id, lastDay: formatLocalDate(addDays(from, -1)), userId,
+          });
+          const attendanceRemoved = await clearAttendance(trx, { orgId, bookingId: booking_id, from: fromStr, to: toStr });
+
+          // Only hold days that were invoiced are credited back.
+          const rate = Number(booking.final_rate) || Number(booking.base_rate) || 0;
+          const billed = await invoicedDaysIn(trx, orgId, booking_id, from, to);
+          const credit = await applySystemCreditNote(trx, {
+            orgId, userId, bookingId: booking_id, invoiceId: billed.invoiceId,
+            amount: billed.days * rate,
+            creditType: 'Hold',
+            creditNoteType: 'SERVICE_ADJUSTMENT',
+            reason: `Service on hold ${fromStr} to ${toStr}: ${billed.days} billed day(s) × ₹${rate}/day`
+              + (reason ? ` — ${reason}` : ''),
+            creditDate: fromStr,
+          });
+          const ticketsResolved = await resolveOpenTickets(trx, { orgId, bookingId: booking_id, pattern: '%hold%', userId });
+
+          return {
+            hold_id: holdId,
+            from_date: fromStr,
+            to_date: toStr,
+            hold_days: daysInclusive(from, to),
+            billed_hold_days: billed.days,
+            daily_rate: rate,
+            credit_amount: credit ? credit.amount : 0,
+            credit_note_id: credit ? credit.id : null,
+            released_caregivers: released.length,
+            attendance_removed: attendanceRemoved,
+            tickets_resolved: ticketsResolved,
+            ...(await accountPosition(trx, orgId, booking_id)),
+          };
+        });
+      } catch (holdErr) {
+        if (holdErr.status === 409) return res.status(409).json({ message: holdErr.message });
+        throw holdErr;
+      }
+
+      res.status(201).json({ message: 'Booking put on hold.', hold_summary: summary });
 
       // ── Audit log (Phase 4.2, fire-and-forget) ──────────────────────────────
       logAudit({
@@ -650,43 +666,26 @@ else if (status == 5) {
         entityId:   booking_id,
         action:     'STATUS_CHANGE',
         changedBy:  userId,
-        org_id:     getOrgId(req),
-        newValues:  { status: 'HOLD', from_date, to_date, reason },
+        org_id:     orgId,
+        newValues:  { status: 'HOLD', from_date: fromStr, to_date: toStr, reason },
       });
 
-      // ── Auto-create hold credit note (fire-and-forget) ──────────────────────
-      setImmediate(() => _createHoldCreditNote({
-        booking_id,
-        from_date,
-        to_date,
-        inv_id:     inv_id || null,
-        org_id:     getOrgId(req),
-        created_by: userId,
-      }));
-
-      // ── Notify client of service hold (fire-and-forget) ─────────────────────
+      // ── Notify client of the hold credit (fire-and-forget) ──────────────────
       setImmediate(async () => {
         try {
+          if (!summary.credit_amount) return;
           // bookings.user_id is a CLIENT id → edx_client_app_users.
-          const booking = await getClientContact(holdTarget.user_id, orgId);
-          if (booking && booking.user_email) {
-            const finalRate = parseFloat(holdTarget.final_rate) || 0;
-            let holdDays = 0;
-            if (from_date && to_date) {
-              const s = new Date(from_date);
-              const e = new Date(to_date);
-              holdDays = s <= e ? Math.ceil((e - s) / (1000 * 60 * 60 * 24)) + 1 : 0;
-            }
-            const creditAmount = holdDays * finalRate;
+          const client = await getClientContact(holdTarget.user_id, orgId);
+          if (client && client.user_email) {
             const tpl = creditNoteGenerated({
-              clientName:  booking.user_name || 'Client',
+              clientName:  client.user_name || 'Client',
               creditType:  'Hold',
-              amount:      creditAmount,
+              amount:      summary.credit_amount,
               bookingId:   booking_id,
-              noteId:      0,
+              noteId:      summary.credit_note_id,
               reason:      reason || 'Service on hold',
             });
-            await sendEmail({ to: booking.user_email, ...tpl });
+            await sendEmail({ to: client.user_email, ...tpl });
           }
         } catch (emailErr) {
           logger.warn(`[email] Hold credit note email failed for booking #${booking_id}: ${emailErr.message}`);
@@ -865,6 +864,10 @@ else if (status == 5) {
           message: `Booking #${built.bookingId} was not found for this organisation.`,
         });
       }
+      // No attendance after a cancelled booking's last day or inside a hold.
+      const blocks = await loadAttendanceBlocks(db, orgId, [built.bookingId]);
+      const blocked = attendanceBlockReason(blocks, built.bookingId, built.row.att_date);
+      if (blocked) return res.status(400).json({ message: blocked });
 
       await _upsertAttendance(db, built.row, userId, now);
 
@@ -910,10 +913,14 @@ else if (status == 5) {
             .map(r => r.id)
         : [];
       const existingSet = new Set(existing);
+      const blocks = await loadAttendanceBlocks(db, orgId, existing);
 
       const toUpsert = [];
       for (const b of built) {
-        if (existingSet.has(b.bookingId)) toUpsert.push(b.row);
+        const blocked = existingSet.has(b.bookingId)
+          ? attendanceBlockReason(blocks, b.bookingId, b.row.att_date) : null;
+        if (blocked) failed.push({ index: b.index, hp_id: b.row.hp_id, error: blocked });
+        else if (existingSet.has(b.bookingId)) toUpsert.push(b.row);
         else failed.push({ index: b.index, hp_id: b.row.hp_id, error: `Booking #${b.bookingId} not found.` });
       }
 
@@ -1021,14 +1028,17 @@ else if (status == 5) {
       const cancelTarget = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first('id', 'user_id');
       if (!cancelTarget) return res.status(404).json({ message: 'Booking not found.' });
 
-      const cancelDate = parseLocalDate(term_date) ? term_date : formatLocalDate(new Date());
+      const cancelDay = parseLocalDate(term_date) || parseLocalDate(new Date());
+      const cancelDate = formatLocalDate(cancelDay);
 
       // Cancel and settle once, in one transaction with the booking locked.
       // Settlement is against what was already INVOICED (the booking was
       // invoiced for its whole period up front): used days over the invoices
-      // → invoice the difference; invoices over the used days → a Pending
-      // 'Cancellation' credit note (normal maker-checker approval). Money the
-      // client overpaid shows as credit and goes back through createRefund.
+      // → invoice the difference; invoices over the used days → a
+      // 'Cancellation' credit note applied at once. The caregivers are
+      // released, attendance after the last service day removed, and the
+      // open cancellation ticket resolved. Money the client overpaid shows as
+      // excess, to refund or transfer to another booking.
       let billingSummary;
       try {
         billingSummary = await withTransaction(async (trx) => {
@@ -1037,23 +1047,33 @@ else if (status == 5) {
             throw Object.assign(new Error('Booking is already cancelled.'), { status: 409 });
           }
 
-          // Computed from the booking as it was before cancelling.
-          const summary = await computeCancellationSettlement(trx, { booking, orgId, cancelDate });
+          // Computed from the booking as it was before cancelling. Billed
+          // days after the cancel date that a hold already credited are not
+          // credited again.
+          const rate = Number(booking.final_rate) || Number(booking.base_rate) || 0;
+          const creditedAfterCancel = await heldCreditAfter(trx, {
+            orgId, bookingId: booking_id, cancelDate: cancelDay, rate,
+          });
+          const summary = await computeCancellationSettlement(trx, {
+            booking, orgId, cancelDate, creditedAfterCancel,
+          });
 
           await trx('edx_service_closed').insert(withOrg(req, {
             booking_id: booking_id || 'NA',
-            term_date: term_date || 'NA',
+            term_date: cancelDate,
             term_reason: term_reason || 'NA',
             term_remarks: term_remarks || 'NA',
             created_on: getCurrentDateTime(),
             created_by: userId
           }));
 
+          // Never started → Booking Cancelled; otherwise Service Cancelled.
+          const started = SERVICE_STARTED_STATUSES.includes(String(booking.status));
           await trx('edx_bookings')
             .where({ id: booking_id, org_id: orgId })
             .update({
-              status: '6',
-              updated_on: db.fn.now(),
+              status: started ? '6' : '3',
+              updated_on: getCurrentDateTime(),
               updated_by: userId
             });
 
@@ -1071,21 +1091,37 @@ else if (status == 5) {
               created_on:      getCurrentDateTime(),
             });
           }
+          let credit = null;
           if (summary && summary.credit_note_amount > 0) {
-            await trx('edx_credit_notes').insert({
-              booking_id,
-              invoice_id:  null,
-              credit_type: 'Cancellation',
-              amount:      summary.credit_note_amount,
-              reason:      `Unused days after cancellation${term_reason && term_reason !== 'NA' ? ` — ${term_reason}` : ''}`,
-              status:      'Pending',
-              credit_date: getCurrentDateTime(),
-              org_id:      orgId,
-              created_by:  userId,
-              created_on:  getCurrentDateTime(),
+            credit = await applySystemCreditNote(trx, {
+              orgId, userId, bookingId: booking_id,
+              amount: summary.credit_note_amount,
+              creditType: 'Cancellation',
+              creditNoteType: 'CANCELLATION',
+              reason: `Unused days after cancellation${term_reason && term_reason !== 'NA' ? ` — ${term_reason}` : ''}`,
             });
           }
-          return summary;
+
+          const released = await releaseBookingCaregivers(trx, { orgId, bookingId: booking_id, lastDay: cancelDate, userId });
+          const attendanceRemoved = await clearAttendance(trx, {
+            orgId, bookingId: booking_id, from: formatLocalDate(addDays(cancelDay, 1)),
+          });
+          const ticketsResolved = await resolveOpenTickets(trx, { orgId, bookingId: booking_id, pattern: '%cancel%', userId });
+          const position = await accountPosition(trx, orgId, booking_id);
+
+          return {
+            ...(summary || {}),
+            cancel_date: cancelDate,
+            credit_note_amount: credit ? credit.amount : 0,
+            credit_note_id: credit ? credit.id : null,
+            released_caregivers: released.length,
+            attendance_removed: attendanceRemoved,
+            tickets_resolved: ticketsResolved,
+            ...position,
+            // What the client owes / is owed after settlement (ledger based).
+            owing: position.owing,
+            refundable: position.excess,
+          };
         });
       } catch (cancelErr) {
         if (cancelErr.status === 409) return res.status(409).json({ message: cancelErr.message });
@@ -1118,7 +1154,8 @@ else if (status == 5) {
       //    committed above) ─────────────────────────────────────────────────
       setImmediate(async () => {
         try {
-          if (!billingSummary) return;
+          // No day-rate settlement (e.g. booking without a rate): no email.
+          if (!billingSummary || billingSummary.days_used == null) return;
           const { owing, refundable } = billingSummary;
           // bookings.user_id is a CLIENT id → edx_client_app_users.
           const bookingData = await getClientContact(cancelTarget.user_id, orgId);
@@ -1128,7 +1165,7 @@ else if (status == 5) {
             const tpl = cancellationBillingSummary({
               clientName:  bookingData.user_name || 'Client',
               bookingId:   booking_id,
-              cancelDate:  term_date || '—',
+              cancelDate:  billingSummary.cancel_date,
               reason:      term_reason || '—',
               daysUsed:    billingSummary.days_used,
               dailyRate:   billingSummary.daily_rate,
@@ -1697,6 +1734,32 @@ const getMatchedHPs = async (req, res) => {
   }
 };
 
+/**
+ * GET /getBookingOpenTickets?booking_id=N → { hold, cancellation }
+ * The latest open hold / cancellation ticket on the booking (or null), so the
+ * Hold and Cancel dialogs can start from what the request asked for.
+ */
+const getBookingOpenTickets = async (req, res) => {
+  try {
+    const orgId = getOrgId(req);
+    const bookingId = parseInt(req.query.booking_id, 10);
+    if (!Number.isInteger(bookingId)) return res.status(400).json({ message: 'booking_id is required.' });
+
+    const rows = await db('edx_support_requests as t')
+      .join('edx_support_category as c', 'c.id', 't.support_type_id')
+      .where({ 't.org_id': orgId, 'c.org_id': orgId, 't.status': 1 })
+      .where('t.booking_details', String(bookingId))
+      .select('t.id', 't.title', 't.description', 't.comments', 't.start_date', 't.end_date',
+        't.created_on', 'c.name as category')
+      .orderBy('t.id', 'desc');
+    const latest = (word) => (rows || []).find((r) => String(r.category || '').toLowerCase().includes(word)) || null;
+    res.json({ hold: latest('hold'), cancellation: latest('cancel') });
+  } catch (err) {
+    logger.error(`[getBookingOpenTickets] error: ${err.message}`);
+    res.status(500).json({ message: 'Failed to load the booking\'s open tickets.' });
+  }
+};
+
 module.exports = guardOrgHandlers({
     createBooking,
     getUserBookings,
@@ -1714,4 +1777,5 @@ module.exports = guardOrgHandlers({
     finalBookingSave,
     getMatchedHPs,  // Phase 4.4
     getAttendanceList,
+    getBookingOpenTickets,
   });

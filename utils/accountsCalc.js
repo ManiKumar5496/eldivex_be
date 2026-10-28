@@ -209,7 +209,9 @@ const SERVICE_STARTED_STATUSES = [BOOKING_STATUS.SERVICE_STARTED, BOOKING_STATUS
  * whether the service started). Returns null when the booking has no valid
  * start date / rate or the cancel date is invalid.
  */
-async function computeCancellationSettlement(conn, { booking, orgId, cancelDate }) {
+// `creditedAfterCancel`: billed days after the cancel date already credited by
+// a hold, so the unused-days credit doesn't credit them a second time.
+async function computeCancellationSettlement(conn, { booking, orgId, cancelDate, creditedAfterCancel = 0 }) {
   if (!booking || orgId == null) return null;
   const start = parseLocalDate(booking.service_start_date);
   const cancel = parseLocalDate(cancelDate);
@@ -235,7 +237,7 @@ async function computeCancellationSettlement(conn, { booking, orgId, cancelDate 
       .whereIn('status', ['Pending', 'Approved']),
     'amount');
 
-  const diff = round2(amountDue - (billed - priorCredit));
+  const diff = round2(amountDue - (billed - priorCredit - (Number(creditedAfterCancel) || 0)));
   const balance = round2(amountDue - paid + refunded);
 
   return {
