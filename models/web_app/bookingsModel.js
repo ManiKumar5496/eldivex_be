@@ -176,14 +176,20 @@ async function getUserBookingsModel(filters = {}, login_data) {
         END AS service_type_name
       `),
       // ✅ Single extension status field
+      // Only Service Started (status 4) bookings can be extended; every other
+      // status is 0. 1/2/3 = ends today / tomorrow / day-after, 4 = overdue
+      // (end date passed without being extended or closed).
 db.raw(`
-CASE 
+CASE
+  WHEN COALESCE(edx_bookings.status, '') <> '4' THEN 0
   WHEN DATE(edx_bookings.service_end_date) = CURDATE() THEN 1
   WHEN DATE(edx_bookings.service_end_date) = DATE_ADD(CURDATE(), INTERVAL 1 DAY) THEN 2
   WHEN DATE(edx_bookings.service_end_date) = DATE_ADD(CURDATE(), INTERVAL 2 DAY) THEN 3
+  WHEN DATE(edx_bookings.service_end_date) < CURDATE() THEN 4
   ELSE 0
 END AS extension_status
 `),
+      db.raw(`GREATEST(DATEDIFF(CURDATE(), DATE(edx_bookings.service_end_date)), 0) AS overdue_days`),
 
       // Open (status 1) hold / cancellation tickets for this booking. The
       // ticket category is resolved by NAME within the booking's org — category
