@@ -183,6 +183,14 @@ app.use('/api', hostelsRoutes);
 const notificationsRoutes = require('./routes/notificationsRoutes');
 app.use('/api', notificationsRoutes);
 
+// ── Web apps (Flutter web builds) ─────────────────────────────────────────────
+// Owner portal at /owner/ (built with --base-href /owner/), tenant dashboard
+// at /. Both use hash URLs (/#/login), so every page load hits index.html and
+// no SPA fallback route is needed. Mounted after /api so it never shadows it.
+const webApp = (dir) => express.static(path.join(__dirname, 'public', dir), { dotfiles: 'deny' });
+app.use('/owner', webApp('owner'));
+app.use('/', webApp('app'));
+
 // ── Phase 4.3 — Weekly report cron ───────────────────────────────────────────
 const { startWeeklyReportCron } = require('./cron/weeklyReport');
 startWeeklyReportCron();
