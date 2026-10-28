@@ -91,6 +91,8 @@ function chain(value) {
     select:     jest.fn().mockReturnThis(),
     orderBy:    jest.fn().mockReturnThis(),
     limit:      jest.fn().mockReturnThis(),
+    sum:        jest.fn().mockReturnThis(),
+    forUpdate:  jest.fn().mockReturnThis(),
     first:      jest.fn().mockResolvedValue(value),
     insert:     jest.fn().mockResolvedValue(Array.isArray(value) ? value : [1]),
     update:     jest.fn().mockResolvedValue(1),
@@ -631,13 +633,27 @@ describe('markAttendanceBatch', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('cancelUserService', () => {
-  function setupCancelTrx() {
-    const trx = jest.fn().mockReturnValue({
-      insert: jest.fn().mockResolvedValue([1]),
-      where:  jest.fn().mockReturnThis(),
-      update: jest.fn().mockResolvedValue(1),
+  // A started booking: 90 days from 2026-06-01 at ₹1,000/day.
+  const startedBooking = {
+    id: 5, user_id: 3, status: '4', final_rate: '1000',
+    service_start_date: '2026-06-01', service_end_date: '2026-08-29',
+  };
+
+  // Transaction mock: the locked booking row, ₹billed invoiced and ₹paid
+  // received so far; one chain per trx() call, recorded per table.
+  function setupCancelTrx({ booking = startedBooking, billed = '0', paid = '0' } = {}) {
+    const calls = {};
+    const trx = jest.fn((table) => {
+      let c;
+      if (table === 'edx_bookings') c = chain(booking);
+      else if (table === 'edx_invoice') c = chain({ total: billed });
+      else if (table === 'edx_receipts') c = chain({ total: paid });
+      else c = chain({ total: '0' });
+      (calls[table] = calls[table] || []).push(c);
+      return c;
     });
-    withTransaction.mockImplementation(async (fn) => { await fn(trx); });
+    trx.calls = calls;
+    withTransaction.mockImplementation(async (fn) => fn(trx));
     return trx;
   }
 
@@ -669,11 +685,42 @@ describe('cancelUserService', () => {
     const res = mockRes();
     await cancelUserService(mockReq({ booking_id: 5 }), res);
     expect(trx).toHaveBeenCalledWith('edx_service_closed');
-    expect(trx).toHaveBeenCalledWith('edx_bookings');
-    const bookingsIdx = trx.mock.calls.findIndex(([t]) => t === 'edx_bookings');
-    expect(trx.mock.results[bookingsIdx].value.update).toHaveBeenCalledWith(
-      expect.objectContaining({ status: '6' })
-    );
+    const updated = trx.calls.edx_bookings.some((c) => c.update.mock.calls.some(
+      ([row]) => row && row.status === '6'));
+    expect(updated).toBe(true);
+  });
+
+  test('credits unused billed days instead of invoicing them again', async () => {
+    // Invoiced ₹90,000 up front for 90 days; cancelled after 10 days used.
+    const trx = setupCancelTrx({ billed: '90000', paid: '0' });
+    const res = mockRes();
+    await cancelUserService(mockReq({ booking_id: 5, term_date: '2026-06-10' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(201);
+    const notes = trx.calls.edx_credit_notes.flatMap((c) => c.insert.mock.calls.map(([row]) => row));
+    expect(notes).toEqual([
+      expect.objectContaining({ credit_type: 'Cancellation', amount: 80000, status: 'Pending' }),
+    ]);
+    const invoiced = (trx.calls.edx_invoice || []).some((c) => c.insert.mock.calls.length > 0);
+    expect(invoiced).toBe(false);
+  });
+
+  test('invoices only the used days not yet billed', async () => {
+    // Nothing invoiced yet; 10 days used → one ₹10,000 invoice.
+    const trx = setupCancelTrx({ billed: '0' });
+    await cancelUserService(mockReq({ booking_id: 5, term_date: '2026-06-10' }), mockRes());
+
+    const inserts = trx.calls.edx_invoice.flatMap((c) => c.insert.mock.calls.map(([row]) => row));
+    expect(inserts).toEqual([expect.objectContaining({ inv_raised_amnt: 10000 })]);
+  });
+
+  test('responds 409 when the booking is already cancelled', async () => {
+    const trx = setupCancelTrx({ booking: { ...startedBooking, status: '6' } });
+    const res = mockRes();
+    await cancelUserService(mockReq({ booking_id: 5, term_date: '2026-06-10' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(trx).not.toHaveBeenCalledWith('edx_service_closed');
   });
 
   test('responds 500 on transaction error', async () => {

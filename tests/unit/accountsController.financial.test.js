@@ -66,6 +66,7 @@ function chain(value) {
     andWhere:   jest.fn().mockReturnThis(),
     whereIn:    jest.fn().mockReturnThis(),
     whereNotIn: jest.fn().mockReturnThis(),
+    whereNotNull: jest.fn().mockReturnThis(),
     leftJoin:   jest.fn().mockReturnThis(),
     join:       jest.fn().mockReturnThis(),
     select:     jest.fn().mockReturnThis(),
@@ -323,6 +324,31 @@ describe('createWriteOffV2', () => {
     reason: 'Patient unable to pay',
   };
 
+  // Routes db() by table for a successful create: booking found, no pending
+  // write-off, ₹1,00,000 outstanding (billed, nothing paid, no adjustments).
+  function routeWriteOffDb({ booking, insertChain, created, billed = '100000' }) {
+    const writeOffs = [chain(null), insertChain, chain(created)];
+    db.mockImplementation((table) => {
+      if (table === 'edx_bookings') return chain(booking);
+      if (table === 'edx_write_offs') return writeOffs.shift() || chain(null);
+      if (table === 'edx_invoice') return chain({ total: billed });
+      if (table === 'edx_receipts') return chain({ total: '0' });
+      if (table === 'edx_transaction_ledger') return chain([]);
+      return chain([1]); // edx_approval_history insert
+    });
+  }
+
+  test('returns 400 when the amount exceeds the outstanding balance', async () => {
+    const insertChain = chain([80]);
+    routeWriteOffDb({ booking: { id: 10, status: 1, user_id: 3 }, insertChain, created: {}, billed: '200' });
+
+    const res = mockRes();
+    await createWriteOffV2(mockReq(validBody), res);   // ₹300 against ₹200 owed
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(insertChain.insert).not.toHaveBeenCalled();
+  });
+
   test('returns 400 when booking_id missing', async () => {
     const res = mockRes();
     await createWriteOffV2(mockReq({ write_off_amount: 100, reason: 'x' }), res);
@@ -388,16 +414,7 @@ describe('createWriteOffV2', () => {
     const booking = { id: 10, status: 1, user_id: 3 };
     const created = { id: 77, booking_id: 10, status: 'Pending', write_off_amount: 300 };
 
-    // 1: booking fetch
-    db.mockReturnValueOnce(chain(booking));
-    // 2: existing write-off check → null
-    db.mockReturnValueOnce(chain(null));
-    // 3: insert into edx_write_offs → [77]
-    db.mockReturnValueOnce(chain([77]));
-    // 4: _addApprovalHistory insert into edx_approval_history
-    db.mockReturnValueOnce(chain([1]));
-    // 5: fetch created write-off
-    db.mockReturnValueOnce(chain(created));
+    routeWriteOffDb({ booking, insertChain: chain([77]), created });
 
     const res = mockRes();
     await createWriteOffV2(mockReq(validBody), res);
@@ -411,12 +428,8 @@ describe('createWriteOffV2', () => {
     const booking = { id: 10, status: 1, user_id: 3 };
     const created = { id: 77, booking_id: 10, approval_level: 'L1' };
 
-    db.mockReturnValueOnce(chain(booking));
-    db.mockReturnValueOnce(chain(null));
     const insertChain = chain([77]);
-    db.mockReturnValueOnce(insertChain);
-    db.mockReturnValueOnce(chain([1]));
-    db.mockReturnValueOnce(chain(created));
+    routeWriteOffDb({ booking, insertChain, created });
 
     const res = mockRes();
     await createWriteOffV2(mockReq({ booking_id: 10, write_off_amount: 400, reason: 'bad debt' }), res);
@@ -430,12 +443,8 @@ describe('createWriteOffV2', () => {
     const booking = { id: 10, status: 1, user_id: 3 };
     const created = { id: 78, booking_id: 10, approval_level: 'L2' };
 
-    db.mockReturnValueOnce(chain(booking));
-    db.mockReturnValueOnce(chain(null));
     const insertChain = chain([78]);
-    db.mockReturnValueOnce(insertChain);
-    db.mockReturnValueOnce(chain([1]));
-    db.mockReturnValueOnce(chain(created));
+    routeWriteOffDb({ booking, insertChain, created });
 
     const res = mockRes();
     await createWriteOffV2(mockReq({ booking_id: 10, write_off_amount: 2000, reason: 'bad debt' }), res);
@@ -449,12 +458,8 @@ describe('createWriteOffV2', () => {
     const booking = { id: 10, status: 1, user_id: 3 };
     const created = { id: 79, booking_id: 10, approval_level: 'L3' };
 
-    db.mockReturnValueOnce(chain(booking));
-    db.mockReturnValueOnce(chain(null));
     const insertChain = chain([79]);
-    db.mockReturnValueOnce(insertChain);
-    db.mockReturnValueOnce(chain([1]));
-    db.mockReturnValueOnce(chain(created));
+    routeWriteOffDb({ booking, insertChain, created });
 
     const res = mockRes();
     await createWriteOffV2(mockReq({ booking_id: 10, write_off_amount: 10000, reason: 'bad debt' }), res);
@@ -525,9 +530,14 @@ describe('approveWriteOff', () => {
         return chain({ id: 10, user_id: 3 });
       }
       if (tableName === 'edx_transaction_ledger') {
-        // first two calls are sum queries in _createTransactionEntry
-        return chain({ total_debit: '0', total_credit: '0' });
+        // Awaited grouped query (outstanding re-check) → no adjustments;
+        // .first() sums in _createTransactionEntry → zero running balance.
+        const c = chain([]);
+        c.first = jest.fn().mockResolvedValue({ total_debit: '0', total_credit: '0' });
+        return c;
       }
+      if (tableName === 'edx_invoice') return chain({ total: '100000' });   // billed
+      if (tableName === 'edx_receipts') return chain({ total: '0' });       // paid
       if (tableName === 'edx_write_offs') {
         // forUpdate().first() re-reads the locked row; update() resolves 1
         return chain(pendingWo);
@@ -624,8 +634,39 @@ describe('createRefund', () => {
     booking_id: 10,
     refund_amount: 200,
     refund_channel: 'BANK_TRANSFER',
-    refund_reason: 'Service not delivered',
+    refund_reason: 'SERVICE_NOT_DELIVERED',
   };
+
+  // Routes db() by table: the booking, ₹paid in approved receipts and ₹committed
+  // in refunds already raised (pending/approved/processing/completed).
+  function routeRefundDb({ booking, paid = '500', committed = '0', insertChain = chain([88]), created = {} }) {
+    const refunds = [chain({ total: committed }), insertChain, chain(created)];
+    db.mockImplementation((table) => {
+      if (table === 'edx_bookings') return chain(booking);
+      if (table === 'edx_receipts') return chain({ total: paid });
+      if (table === 'edx_refunds') return refunds.shift() || chain(null);
+      if (table === 'edx_transaction_ledger') return chain([]);
+      return chain([1]); // edx_approval_history insert
+    });
+    return insertChain;
+  }
+
+  test('returns 400 for an unknown refund_channel', async () => {
+    const res = mockRes();
+    await createRefund(mockReq({ ...validBody, refund_channel: 'CRYPTO' }), res);
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('counts refunds still pending approval against the refundable balance', async () => {
+    // Paid ₹500; a ₹450 refund is already awaiting approval → only ₹50 left.
+    const insertChain = routeRefundDb({ booking: { id: 10, user_id: 3 }, paid: '500', committed: '450' });
+
+    const res = mockRes();
+    await createRefund(mockReq({ ...validBody, refund_amount: 100 }), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(insertChain.insert).not.toHaveBeenCalled();
+  });
 
   test('returns 400 when required fields missing', async () => {
     const res = mockRes();
@@ -649,12 +690,7 @@ describe('createRefund', () => {
   });
 
   test('returns 400 when refund amount exceeds refundable balance', async () => {
-    // 1st: booking found
-    db.mockReturnValueOnce(chain({ id: 10, status: 1, user_id: 3 }));
-    // 2nd: paidRows — total paid = 500
-    db.mockReturnValueOnce(chain({ total: '500' }));
-    // 3rd: alreadyRefunded — already refunded = 400
-    db.mockReturnValueOnce(chain({ total: '400' }));
+    routeRefundDb({ booking: { id: 10, status: 1, user_id: 3 }, paid: '500', committed: '400' });
 
     // maxRefund = 500 - 400 = 100, trying to refund 200
     const res = mockRes();
@@ -670,18 +706,7 @@ describe('createRefund', () => {
     const booking = { id: 10, status: 1, user_id: 3 };
     const created = { id: 88, booking_id: 10, status: 'PENDING_APPROVAL', refund_amount: 50 };
 
-    // 1: booking fetch
-    db.mockReturnValueOnce(chain(booking));
-    // 2: paidRows sum
-    db.mockReturnValueOnce(chain({ total: '500' }));
-    // 3: alreadyRefunded sum
-    db.mockReturnValueOnce(chain({ total: '0' }));
-    // 4: insert into edx_refunds → [88]
-    db.mockReturnValueOnce(chain([88]));
-    // 5: _addApprovalHistory insert
-    db.mockReturnValueOnce(chain([1]));
-    // 6: fetch created refund
-    db.mockReturnValueOnce(chain(created));
+    routeRefundDb({ booking, created });
 
     const res = mockRes();
     await createRefund(mockReq({ ...validBody, refund_amount: 50 }), res);
@@ -696,13 +721,7 @@ describe('createRefund', () => {
     const created = { id: 89, booking_id: 10, status: 'PENDING_APPROVAL' };
     const channelDetails = { bank: 'HDFC', account: '1234567890' };
 
-    db.mockReturnValueOnce(chain(booking));
-    db.mockReturnValueOnce(chain({ total: '500' }));
-    db.mockReturnValueOnce(chain({ total: '0' }));
-    const insertChain = chain([89]);
-    db.mockReturnValueOnce(insertChain);
-    db.mockReturnValueOnce(chain([1]));
-    db.mockReturnValueOnce(chain(created));
+    const insertChain = routeRefundDb({ booking, insertChain: chain([89]), created });
 
     const res = mockRes();
     await createRefund(mockReq({ ...validBody, refund_amount: 50, channel_details: channelDetails }), res);
@@ -853,16 +872,39 @@ describe('approveRefund', () => {
     );
   });
 
-  test('transitions PENDING_APPROVAL to Approved', async () => {
-    // 1: fetch refund
+  // Approval transaction for a booking with ₹paid in and nothing else committed;
+  // `updated` is how many rows the conditional status update changes.
+  function approveTrx({ paid = '500', updated = 1 } = {}) {
+    const trx = jest.fn((table) => {
+      if (table === 'edx_receipts') return chain({ total: paid });
+      if (table === 'edx_refunds') {
+        const c = chain({ total: '0' });
+        c.update = jest.fn().mockResolvedValue(updated);
+        return c;
+      }
+      if (table === 'edx_transaction_ledger') return chain([]);
+      return chain({ id: 10 });
+    });
+    trx.raw = jest.fn().mockReturnValue('RAW_EXPR');
+    withTransaction.mockImplementation(async (fn) => fn(trx));
+    return trx;
+  }
+
+  test('refuses approval when it would refund more than was paid', async () => {
     db.mockReturnValueOnce(chain(pendingRefund));
-    // 2: db('edx_refunds').where.update
-    db.mockReturnValueOnce(chain(1));
-    // 3: _addApprovalHistory insert
-    db.mockReturnValueOnce(chain([1]));
-    // 4: fetch updated
+    approveTrx({ paid: '150' });   // ₹200 refund, only ₹150 paid
+
+    const res = mockRes();
+    await approveRefund(mockReq({ refund_id: 20, action: 'Approved' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+
+  test('transitions PENDING_APPROVAL to Approved', async () => {
+    db.mockReturnValueOnce(chain(pendingRefund));
+    approveTrx();
+    // after the transaction: fetch updated + history
     db.mockReturnValueOnce(chain({ ...pendingRefund, status: 'APPROVED' }));
-    // 5: fetch history
     db.mockReturnValueOnce(chain([]));
 
     const res = mockRes();
@@ -883,9 +925,8 @@ describe('approveRefund', () => {
   });
 
   test('returns 409 when the refund changed state concurrently', async () => {
-    const updateChain = chain(0);
-    updateChain.update = jest.fn().mockResolvedValue(0); // conditional update matched no row
-    db.mockReturnValueOnce(chain(pendingRefund)).mockReturnValueOnce(updateChain);
+    db.mockReturnValueOnce(chain(pendingRefund));
+    approveTrx({ updated: 0 }); // conditional update matched no row
 
     const res = mockRes();
     await approveRefund(mockReq({ refund_id: 20, action: 'Approved' }), res);
@@ -1113,6 +1154,11 @@ describe('applyCreditNote', () => {
       if (tableName === 'edx_credit_note_applications') {
         return chain([99]);
       }
+      // Target invoice ₹1,000 with nothing paid → ₹1,000 open.
+      if (tableName === 'edx_invoice') {
+        return chain([{ id: 20, booking_id: 10, inv_start: '2026-01-01', inv_raised_amnt: '1000' }]);
+      }
+      if (tableName === 'edx_receipts') return chain([]);
       return chain(null);
     });
     trxMock.raw = jest.fn().mockReturnValue('RAW_EXPR');
@@ -1192,11 +1238,38 @@ describe('createInternalTransfer', () => {
     source_booking_id: 10,
     target_booking_id: 20,
     transfer_amount: 500,
-    transfer_type: 'ADVANCE',
+    transfer_type: 'CREDIT_BALANCE_TRANSFER',
     reason: 'Relocation',
   };
   const srcBk = { id: 10, user_id: 3 };
   const tgtBk = { id: 20, user_id: 3 };
+
+  // Routes db() by table: source/target bookings, the source's money (₹paid
+  // received, nothing billed → ₹paid credit) and edx_internal_transfers calls
+  // in order (pending sum, insert, fetch created).
+  function routeTransferDb({ paid = '1000', insertChain = chain([101]), created = {} }) {
+    const bookings = [chain(srcBk), chain(tgtBk)];
+    const transfers = [chain({ total: '0' }), insertChain, chain(created)];
+    db.mockImplementation((table) => {
+      if (table === 'edx_bookings') return bookings.shift() || chain([]);
+      if (table === 'edx_internal_transfers') return transfers.shift() || chain(null);
+      if (table === 'edx_invoice') return chain({ total: '0' });
+      if (table === 'edx_receipts') return chain({ total: paid });
+      if (table === 'edx_transaction_ledger') return chain([]);
+      return chain([1]); // edx_approval_history insert
+    });
+    return insertChain;
+  }
+
+  test('returns 400 when the source booking has less credit than the transfer', async () => {
+    const insertChain = routeTransferDb({ paid: '200' });   // ₹200 credit, moving ₹500
+
+    const res = mockRes();
+    await createInternalTransfer(mockReq(validBody), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(insertChain.insert).not.toHaveBeenCalled();
+  });
 
   test('returns 400 when required fields missing', async () => {
     const res = mockRes();
@@ -1262,15 +1335,7 @@ describe('createInternalTransfer', () => {
   test('creates transfer with PENDING_APPROVAL status on success', async () => {
     const created = { id: 101, status: 'PENDING_APPROVAL', transfer_amount: 500 };
 
-    // Promise.all uses two simultaneous db calls
-    db.mockReturnValueOnce(chain(srcBk));
-    db.mockReturnValueOnce(chain(tgtBk));
-    // insert into edx_internal_transfers
-    db.mockReturnValueOnce(chain([101]));
-    // _addApprovalHistory insert
-    db.mockReturnValueOnce(chain([1]));
-    // fetch created
-    db.mockReturnValueOnce(chain(created));
+    routeTransferDb({ created });
 
     const res = mockRes();
     await createInternalTransfer(mockReq(validBody), res);
@@ -1390,12 +1455,19 @@ describe('approveInternalTransfer', () => {
     const trxMock = jest.fn().mockImplementation((tableName) => {
       if (tableName === 'edx_transaction_ledger') {
         ledgerInsertCount++;
-        // Even calls are the first() sum, we return something usable for both
-        return chain({ total_debit: '0', total_credit: '0' });
+        // Awaited grouped queries (balance re-check) → no rows; .first()
+        // sums in _createTransactionEntry → zero running balance.
+        const c = chain([]);
+        c.first = jest.fn().mockResolvedValue({ total_debit: '0', total_credit: '0' });
+        return c;
       }
       if (tableName === 'edx_internal_transfers') {
         return chain(pendingTransfer); // locked re-read; update() resolves 1
       }
+      // Source booking lock, and ₹10,000 received into it.
+      if (tableName === 'edx_bookings') return chain({ id: 10 });
+      if (tableName === 'edx_invoice') return chain({ total: '0' });
+      if (tableName === 'edx_receipts') return chain({ total: '10000' });
       if (tableName === 'edx_approval_history') {
         return chain([1]);
       }
@@ -1460,5 +1532,276 @@ describe('approveInternalTransfer', () => {
     await approveInternalTransfer(mockReq({ transfer_id: 30, action: 'Approved' }), res);
 
     expect(res.status).toHaveBeenCalledWith(500);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// bulkGenerateInvoices — only bills days no existing invoice covers
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('bulkGenerateInvoices', () => {
+  const { bulkGenerateInvoices } = require('../../controllers/web_app/accountsController');
+
+  // Routes db()/trx() by table; returns the rows inserted into edx_invoice.
+  function setupBulk({ booking, invoices }) {
+    db.mockImplementation((table) => {
+      if (table === 'edx_period_closing') return chain(undefined);
+      if (table === 'edx_bookings') return chain([booking]);
+      return chain([]);
+    });
+    const inserted = [];
+    const trx = jest.fn((table) => {
+      if (table === 'edx_bookings') return chain({ id: booking.id });
+      if (table === 'edx_invoice') {
+        const c = chain(invoices);
+        c.insert = jest.fn((row) => { inserted.push(row); return Promise.resolve([1]); });
+        return c;
+      }
+      return chain([]);
+    });
+    withTransaction.mockImplementation(async (fn) => fn(trx));
+    return inserted;
+  }
+
+  test('does not re-bill a booking already invoiced for its whole period', async () => {
+    // Activation invoiced 15 Jan → 14 Apr; February must not be billed again.
+    const inserted = setupBulk({
+      booking: { id: 7, final_rate: '1000', service_start_date: '2026-01-15', service_end_date: '2026-04-14' },
+      invoices: [{ inv_start: '2026-01-15', inv_end: '2026-04-14' }],
+    });
+
+    const res = mockRes();
+    await bulkGenerateInvoices(mockReq({ month: 2, year: 2026 }), res);
+
+    expect(inserted).toHaveLength(0);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ generated: 0 }));
+  });
+
+  test('bills the whole month for an open-ended booking with no invoice in it', async () => {
+    const inserted = setupBulk({
+      booking: { id: 8, final_rate: '1000', service_start_date: '2026-01-15', service_end_date: null },
+      invoices: [{ inv_start: '2026-01-15', inv_end: '2026-01-31' }],
+    });
+
+    const res = mockRes();
+    await bulkGenerateInvoices(mockReq({ month: 2, year: 2026 }), res);
+
+    expect(inserted).toEqual([
+      expect.objectContaining({
+        booking_id: 8, inv_start: '2026-02-01', inv_end: '2026-02-28', inv_raised_amnt: 28000,
+      }),
+    ]);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ generated: 1 }));
+  });
+
+  test('bills only the uncovered days when part of the month is invoiced', async () => {
+    const inserted = setupBulk({
+      booking: { id: 9, final_rate: '1000', service_start_date: '2026-01-01', service_end_date: null },
+      invoices: [{ inv_start: '2026-02-01', inv_end: '2026-02-10' }],
+    });
+
+    await bulkGenerateInvoices(mockReq({ month: 2, year: 2026 }), mockRes());
+
+    expect(inserted).toEqual([
+      expect.objectContaining({ inv_start: '2026-02-11', inv_end: '2026-02-28', inv_raised_amnt: 18000 }),
+    ]);
+  });
+
+  test('rejects an invalid month with 400', async () => {
+    const res = mockRes();
+    await bulkGenerateInvoices(mockReq({ month: 13, year: 2026 }), res);
+    expect(res.status).toHaveBeenCalledWith(400);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Write-off approval: balance re-check and the legacy endpoint's ledger post
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('write-off approval re-checks the balance and always posts to the ledger', () => {
+  const { approveWriteOff, updateWriteOffStatus } = require('../../controllers/web_app/accountsController');
+  const wo = {
+    id: 56, booking_id: 10, user_id: 3, write_off_amount: '5000',
+    status: 'Pending', reason: 'Bad debt', approval_level: 'L2', created_by: 1,
+  };
+
+  // Transaction mock for one booking billed `billed` and paid `paid`; returns
+  // the rows inserted into edx_transaction_ledger.
+  function trxFor({ billed, paid }) {
+    const ledgerRows = [];
+    const trx = jest.fn((table) => {
+      if (table === 'edx_write_offs') return chain(wo);
+      if (table === 'edx_bookings') return chain({ id: 10, user_id: 3 });
+      if (table === 'edx_invoice') return chain({ total: billed });
+      if (table === 'edx_receipts') return chain({ total: paid });
+      if (table === 'edx_transaction_ledger') {
+        const c = chain([]);
+        c.first = jest.fn().mockResolvedValue({ total_debit: '0', total_credit: '0' });
+        c.insert = jest.fn((row) => { ledgerRows.push(row); return Promise.resolve([77]); });
+        return c;
+      }
+      return chain([1]);
+    });
+    trx.raw = jest.fn().mockReturnValue('RAW_EXPR');
+    withTransaction.mockImplementation(async (fn) => fn(trx));
+    return ledgerRows;
+  }
+
+  test('approveWriteOff refuses a write-off larger than the outstanding balance', async () => {
+    db.mockReturnValueOnce(chain(wo));
+    const ledgerRows = trxFor({ billed: '3000', paid: '0' });   // owes ₹3,000, write-off ₹5,000
+
+    const res = mockRes();
+    await approveWriteOff(mockReq({ write_off_id: 56, action: 'Approved' }), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(ledgerRows).toHaveLength(0);
+  });
+
+  test('legacy updateWriteOffStatus approval posts the WRITE_OFF ledger entry', async () => {
+    db.mockReturnValueOnce(chain(wo));
+    const ledgerRows = trxFor({ billed: '10000', paid: '0' });
+
+    const res = mockRes();
+    await updateWriteOffStatus(mockReq({ id: 56, status: 'Approved' }), res);
+
+    expect(ledgerRows).toEqual([
+      expect.objectContaining({ transaction_type: 'WRITE_OFF', direction: 'CREDIT', amount: 5000, booking_id: 10 }),
+    ]);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Write-off approved successfully.' }));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// applyCreditNote: same client only, never past the invoice's open balance
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('applyCreditNote limits', () => {
+  const { applyCreditNote } = require('../../controllers/web_app/accountsController');
+  const body = { credit_note_id: 5, target_booking_id: 10, target_invoice_id: 20, amount_to_apply: 300 };
+  const cn = { id: 5, booking_id: 11, amount: '500', remaining_amount: '500', used_amount: '0', status: 'Approved' };
+
+  test('refuses a credit note that belongs to a different client', async () => {
+    db.mockReturnValueOnce(chain(cn))                                   // credit note
+      .mockReturnValueOnce(chain({ id: 20, booking_id: 10 }))            // target invoice
+      .mockReturnValueOnce(chain({ id: 10, user_id: 3 }))                // target booking (client 3)
+      .mockReturnValueOnce(chain({ user_id: 4 }));                       // credit note's booking (client 4)
+
+    const res = mockRes();
+    await applyCreditNote(mockReq(body), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(withTransaction).not.toHaveBeenCalled();
+  });
+
+  test('refuses more than the invoice still has open', async () => {
+    db.mockReturnValueOnce(chain(cn))
+      .mockReturnValueOnce(chain({ id: 20, booking_id: 10 }))
+      .mockReturnValueOnce(chain({ id: 10, user_id: 3 }))
+      .mockReturnValueOnce(chain({ user_id: 3 }));                       // same client
+
+    const appInsert = jest.fn().mockResolvedValue([1]);
+    const trx = jest.fn((table) => {
+      if (table === 'edx_credit_notes') return chain(cn);
+      // ₹1,000 invoice with ₹800 already received → ₹200 open; applying ₹300.
+      if (table === 'edx_invoice') return chain([{ id: 20, booking_id: 10, inv_start: '2026-01-01', inv_raised_amnt: '1000' }]);
+      if (table === 'edx_receipts') return chain([{ booking_id: 10, invoice_id: 20, total_amount: '800' }]);
+      if (table === 'edx_credit_note_applications') { const c = chain([]); c.insert = appInsert; return c; }
+      return chain(null);
+    });
+    trx.raw = jest.fn().mockReturnValue('RAW_EXPR');
+    withTransaction.mockImplementation(async (fn) => fn(trx));
+
+    const res = mockRes();
+    await applyCreditNote(mockReq(body), res);
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(appInsert).not.toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// getInvoices — paid / balance / status are per invoice, not per booking
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('getInvoices per-invoice balances', () => {
+  const { getInvoices } = require('../../controllers/web_app/accountsController');
+
+  test('a payment is not credited to every invoice of the booking', async () => {
+    // Two ₹30,000 invoices on booking 10, one unlinked ₹30,000 receipt.
+    const rows = [
+      { invoice_db_id: 2, booking_id: 10, total_amount: '30000', due_date: '2099-03-15' },
+      { invoice_db_id: 1, booking_id: 10, total_amount: '30000', due_date: '2099-02-15' },
+    ];
+    db.mockImplementation((table) => {
+      if (table === 'edx_invoice as i') return chain(rows);
+      if (table === 'edx_invoice') {
+        return chain([
+          { id: 1, booking_id: 10, inv_start: '2026-01-01', inv_raised_amnt: '30000' },
+          { id: 2, booking_id: 10, inv_start: '2026-02-01', inv_raised_amnt: '30000' },
+        ]);
+      }
+      if (table === 'edx_receipts') return chain([{ booking_id: 10, invoice_id: null, total_amount: '30000' }]);
+      return chain([]);
+    });
+
+    const res = mockRes();
+    await getInvoices(mockReq({}, {}), res);
+
+    const out = res.json.mock.calls[0][0];
+    const byId = Object.fromEntries(out.map((r) => [r.invoice_db_id, r]));
+    expect(byId[1]).toEqual(expect.objectContaining({ paid_amount: 30000, balance_due: 0, status: 'Paid' }));
+    expect(byId[2]).toEqual(expect.objectContaining({ paid_amount: 0, balance_due: 30000, status: 'Pending' }));
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Receipts: recorded payments can be cancelled (maker-checker)
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('updateReceiptStatus', () => {
+  const { updateReceiptStatus } = require('../../controllers/web_app/accountsController');
+  const approved = { id: 12, booking_id: 10, total_amount: '1000', status: 'Approved', created_by: 1 };
+
+  function routeReceiptDb({ receipt, updated = 1, paid = '1000', committed = '0' }) {
+    const updateSpy = jest.fn().mockResolvedValue(updated);
+    let receiptCalls = 0;
+    db.mockImplementation((table) => {
+      if (table === 'edx_receipts') {
+        receiptCalls++;
+        if (receiptCalls === 1) return chain(receipt);           // fetch
+        const c = chain({ total: paid });                         // refundable sum / update
+        c.update = updateSpy;
+        return c;
+      }
+      if (table === 'edx_refunds') return chain({ total: committed });
+      return chain([]);
+    });
+    return updateSpy;
+  }
+
+  test('a different user can cancel a recorded payment', async () => {
+    const updateSpy = routeReceiptDb({ receipt: approved });
+    const res = mockRes();
+    await updateReceiptStatus(mockReq({ id: 12, status: 'Cancelled' }), res);
+    expect(updateSpy).toHaveBeenCalledWith(expect.objectContaining({ status: 'Cancelled' }));
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ message: 'Receipt cancelled successfully.' }));
+  });
+
+  test('the user who recorded a payment cannot cancel it', async () => {
+    const updateSpy = routeReceiptDb({ receipt: { ...approved, created_by: 99 } });
+    const res = mockRes();
+    await updateReceiptStatus(mockReq({ id: 12, status: 'Cancelled' }), res);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(updateSpy).not.toHaveBeenCalled();
+  });
+
+  test('cannot cancel a payment that refunds were raised against', async () => {
+    const updateSpy = routeReceiptDb({ receipt: approved, paid: '1000', committed: '600' });
+    const res = mockRes();
+    await updateReceiptStatus(mockReq({ id: 12, status: 'Cancelled' }), res);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(updateSpy).not.toHaveBeenCalled();
   });
 });

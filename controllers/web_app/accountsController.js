@@ -11,8 +11,18 @@
 const db = require('../../config/db');
 const logger = require('../../logger');
 const applyBranchFilter = require('../../utils/applyBranchFilter');
-const { getCurrentDateTime, toMysqlDate } = require('../../utils/dateTime');
+const { getCurrentDateTime, toMysqlDate, mysqlDateAddDays } = require('../../utils/dateTime');
 const { withOrg, orgQuery, getOrgId } = require('../../utils/orgScope');
+const {
+  MONEY_EPS, round2, parseMoney, parseLocalDate, formatLocalDate, uncoveredSegments,
+  allocateInvoicePayments, invoiceStatus, computeCancellationSettlement,
+} = require('../../utils/accountsCalc');
+const {
+  LEDGER_NET_CREDIT_SQL,
+  createTransactionEntry: _createTransactionEntry,
+  computeOutstanding: _computeOutstanding,
+} = require('../../utils/accountsLedger');
+const { bookingStatusLabel } = require('../../utils/bookingStatus');
 const withTransaction = require('../../utils/withTransaction');
 const { sendEmail } = require('../../utils/emailService');
 const { paymentReminder, creditNoteGenerated, paymentReceiptEmail } = require('../../utils/emailTemplates');
@@ -26,21 +36,48 @@ const crypto = require('crypto');
 // (front ends read either). Field names of requests are unchanged.
 const errBody = (text, extra = {}) => ({ ...extra, error: text, message: text });
 
+// Allowed enum values — mirror the column ENUMs in migrations 006 / 010.
+const CREDIT_TYPES     = ['Hold', 'Cancellation', 'Overpayment', 'Other'];
+const WRITE_OFF_TYPES  = ['BAD_DEBT', 'BILLING_ERROR', 'GOODWILL', 'ADJUSTMENT'];
+const REFUND_CHANNELS  = ['CASH', 'BANK_TRANSFER', 'UPI', 'CHEQUE', 'GATEWAY_REVERSAL'];
+const REFUND_REASONS   = ['SERVICE_NOT_DELIVERED', 'PARTIAL_DELIVERY', 'OVERPAYMENT', 'QUALITY_ISSUE', 'GOODWILL', 'CREDIT_NOTE_CASHOUT'];
+const TRANSFER_TYPES   = ['OVERPAYMENT_TRANSFER', 'RECEIPT_REALLOCATION', 'CREDIT_BALANCE_TRANSFER', 'SERVICE_SWITCH'];
+
+// Refund states that already commit (or have spent) the booking's money.
+const REFUND_COMMITTED_STATUSES = ['PENDING_APPROVAL', 'APPROVED', 'PROCESSING', 'COMPLETED'];
+const REFUND_IN_FLIGHT_STATUSES = ['PENDING_APPROVAL', 'APPROVED', 'PROCESSING'];
+
+const fmt2 = (n) => round2(n).toFixed(2);
+const enumError = (field, allowed) => errBody(`${field} must be one of: ${allowed.join(', ')}`);
+
+// Body value that must agree with the booking when it is sent at all.
+const disagrees = (bodyValue, bookingValue) =>
+  bodyValue !== undefined && bodyValue !== null && bodyValue !== '' &&
+  String(bodyValue) !== String(bookingValue);
+
 // ── 1. Get Active Clients ─────────────────────────────────────────────────────
 
 /**
  * GET /api/getActiveClients
  * Returns bookings with aggregated billing totals.
  * Respects branch_access from JWT.
+ *
+ * outstanding_amount uses the shared formula (utils/accountsLedger): billed −
+ * approved receipts − net ledger credits (write-offs, applied credit notes,
+ * transfers in) + ledger debits (transfers out, refunds). Each total comes from
+ * a per-booking grouped derived table (MySQL 5.7 safe — no correlated refs).
+ * No default row cap: limit / offset apply only when passed.
  */
 const getActiveClients = async (req, res) => {
   try {
     const user = req.login_data;
+    const orgId = getOrgId(req);
+    const orgBookingIds = () => db('edx_bookings').select('id').where('org_id', orgId);
 
     // NOTE: orgQuery() returns a query builder with no .alias() method.
     // Use db('table as alias').where() directly for aliased main table queries.
     let query = db('edx_bookings as b')
-      .where('b.org_id', getOrgId(req))
+      .where('b.org_id', orgId)
       .leftJoin('edx_client_app_users as u', 'b.user_id', 'u.id')
       .leftJoin('edx_patient as p',         'b.patient_id', 'p.id')
       .leftJoin('edx_master_services as ms', 'b.service_type_id', 'ms.id')
@@ -49,6 +86,7 @@ const getActiveClients = async (req, res) => {
         db('edx_invoice')
           .select('booking_id')
           .sum('inv_raised_amnt as total_billed')
+          .whereIn('booking_id', orgBookingIds())
           .groupBy('booking_id')
           .as('inv'),
         'inv.booking_id', 'b.id'
@@ -58,9 +96,19 @@ const getActiveClients = async (req, res) => {
           .select('booking_id')
           .sum('total_amount as total_paid')
           .where('status', 'Approved')
+          .whereIn('booking_id', orgBookingIds())
           .groupBy('booking_id')
           .as('rec'),
         'rec.booking_id', 'b.id'
+      )
+      .leftJoin(
+        db('edx_transaction_ledger')
+          .select('booking_id', db.raw(`${LEDGER_NET_CREDIT_SQL} as ledger_credit`))
+          .where({ org_id: orgId, status: 'COMPLETED' })
+          .whereNotNull('booking_id')
+          .groupBy('booking_id')
+          .as('led'),
+        'led.booking_id', 'b.id'
       )
       .select(
         'b.id',
@@ -78,10 +126,12 @@ const getActiveClients = async (req, res) => {
         'p.patient_name',
         'ms.name as service_name',
         'br.br_name as branch_name',
+        db.raw("COALESCE(NULLIF(TRIM(br.br_city), ''), NULLIF(TRIM(u.user_service_city), '')) as city"),
         db.raw('COALESCE(inv.total_billed, 0) as total_billed'),
         db.raw('COALESCE(rec.total_paid, 0) as total_paid'),
-        db.raw('COALESCE(inv.total_billed, 0) - COALESCE(rec.total_paid, 0) as outstanding_amount')
-      );
+        db.raw('COALESCE(inv.total_billed, 0) - COALESCE(rec.total_paid, 0) - COALESCE(led.ledger_credit, 0) as outstanding_amount')
+      )
+      .orderBy('b.id', 'desc');
 
     // Apply branch access filter
     query = applyBranchFilter(query, user, 'b.branch_id');
@@ -91,13 +141,14 @@ const getActiveClients = async (req, res) => {
       query = query.where('b.status', req.query.status);
     }
 
-    // Optional pagination
-    const limit  = parseInt(req.query.limit)  || 100;
-    const offset = parseInt(req.query.offset) || 0;
-    query = query.limit(limit).offset(offset);
+    // Optional pagination — only when the caller asks for it.
+    const limit  = parseInt(req.query.limit, 10);
+    const offset = parseInt(req.query.offset, 10);
+    if (Number.isFinite(limit) && limit > 0) query = query.limit(limit);
+    if (Number.isFinite(offset) && offset > 0) query = query.offset(offset);
 
     const data = await query;
-    res.json(data);
+    res.json(data.map((r) => ({ ...r, status_label: bookingStatusLabel(r.status), city: r.city ?? null })));
   } catch (err) {
     logger.error(`Error getActiveClients: ${err.message}`);
     res.status(500).json(errBody('An error occurred while fetching active clients.'));
@@ -124,14 +175,20 @@ const createProvisionalReceipt = async (req, res) => {
       receipt_date,
       period_from,
       period_to,
+      invoice_id,
     } = req.body;
 
     if (!booking_id || !amount) {
       return res.status(400).json(errBody('booking_id and amount are required.'));
     }
 
-    if (Number(amount) <= 0) {
-      return res.status(400).json(errBody('Amount must be greater than zero.'));
+    const amt = parseMoney(amount);
+    if (amt === null || amt <= 0) {
+      return res.status(400).json(errBody('Amount must be a number greater than zero.'));
+    }
+    const tax = parseMoney(tax_amount ?? 0);
+    if (tax === null || tax < 0) {
+      return res.status(400).json(errBody('tax_amount must be zero or more.'));
     }
 
     const orgId = getOrgId(req);
@@ -145,11 +202,18 @@ const createProvisionalReceipt = async (req, res) => {
       return res.status(400).json(errBody('Cannot create receipt for a cancelled booking.'));
     }
 
-    // Guard: period must not be closed
-    if (period_from) {
-      const periodDate  = new Date(period_from);
-      const periodMonth = periodDate.getMonth() + 1;
-      const periodYear  = periodDate.getFullYear();
+    // The invoice this payment settles must be this booking's.
+    if (invoice_id) {
+      const inv = await db('edx_invoice').where({ id: invoice_id, booking_id }).first('id');
+      if (!inv) return res.status(400).json(errBody('invoice_id does not belong to this booking.'));
+    }
+
+    // Guard: the month the money is received in must not be closed. (Not the
+    // service period — a late payment for a closed month's invoice is fine.)
+    const receivedOn = parseLocalDate(receipt_date) || parseLocalDate(formatLocalDate(new Date()));
+    {
+      const periodMonth = receivedOn.getMonth() + 1;
+      const periodYear  = receivedOn.getFullYear();
       const closedPeriod = await db('edx_period_closing')
         .where({ org_id: orgId, period_month: periodMonth, period_year: periodYear, status: 'Closed' })
         .first();
@@ -160,7 +224,7 @@ const createProvisionalReceipt = async (req, res) => {
       }
     }
 
-    const total_amount = Number(amount) + Number(tax_amount);
+    const total_amount = round2(amt + tax);
 
     // Generate receipt_number before insert using current org count
     const countRow = await db('edx_receipts').where({ org_id: orgId }).count('id as cnt').first();
@@ -170,9 +234,10 @@ const createProvisionalReceipt = async (req, res) => {
     const [id] = await db('edx_receipts').insert(withOrg(req, {
       receipt_number,
       booking_id,
+      invoice_id:     invoice_id     || null,
       user_id:        user_id        || null,
-      amount:         Number(amount),
-      tax_amount:     Number(tax_amount),
+      amount:         round2(amt),
+      tax_amount:     round2(tax),
       total_amount,
       payment_mode:   payment_mode   || 'Cash',
       transaction_id: transaction_id || null,
@@ -252,31 +317,52 @@ const updateReceiptStatus = async (req, res) => {
       return res.status(400).json(errBody('status must be Approved or Cancelled.'));
     }
 
-    // Guard: only Pending receipts can be updated
+    const orgId = getOrgId(req);
+    const userId = req.login_data.id;
     const receipt = await db('edx_receipts')
       .where({ id })
-      .andWhere('org_id', getOrgId(req))
+      .andWhere('org_id', orgId)
       .first();
     if (!receipt) {
       return res.status(404).json(errBody('Receipt not found.'));
     }
-    if (receipt.status !== 'Pending') {
+
+    // Pending → Approved / Cancelled; a recorded (Approved) payment can be
+    // cancelled to correct a mistake.
+    const allowed = { Pending: ['Approved', 'Cancelled'], Approved: ['Cancelled'] };
+    if (!allowed[receipt.status]?.includes(status)) {
       return res.status(400).json(errBody(
         `Receipt is already ${receipt.status}. No changes allowed.`,
       ));
     }
 
+    if (receipt.status === 'Approved') {
+      // Reversing money already counted as paid: maker-checker, and never
+      // below what has been committed to refunds from this booking.
+      if (_isOwnRequest(receipt, userId)) {
+        return res.status(403).json(errBody('You cannot cancel a payment you recorded.'));
+      }
+      if (receipt.booking_id) {
+        const refundable = await _refundableBalance(db, orgId, receipt.booking_id);
+        if (refundable - round2(receipt.total_amount) < -MONEY_EPS) {
+          return res.status(400).json(errBody(
+            'Refunds have already been raised against this payment. Reject or reverse them first.',
+          ));
+        }
+      }
+    }
+
     const updated = await db('edx_receipts')
-      .where({ id })
-      .andWhere('org_id', getOrgId(req))
+      .where({ id, status: receipt.status })
+      .andWhere('org_id', orgId)
       .update({
         status,
-        updated_by: req.login_data.id,
+        updated_by: userId,
         updated_on: getCurrentDateTime(),
       });
 
     if (!updated) {
-      return res.status(404).json(errBody('Receipt not found.'));
+      return res.status(409).json(errBody('Receipt was already updated.'));
     }
 
     res.json({ message: `Receipt ${status.toLowerCase()} successfully.` });
@@ -331,25 +417,59 @@ const getClientStatements = async (req, res) => {
         db.raw("'Payment' as type"),
         db.raw('0 as debit'),
         db.raw('COALESCE(r.total_amount, 0) as credit'),
-        db.raw("CONCAT('REC-', r.id) as reference_number"),
+        db.raw("COALESCE(NULLIF(r.receipt_number, ''), CONCAT('REC-', r.id)) as reference_number"),
         db.raw("CONCAT('Payment via ', r.payment_mode) as description")
       );
 
     if (booking_id) receiptQ = receiptQ.where('r.booking_id', booking_id);
     if (user_id)    receiptQ = receiptQ.where('b.user_id', user_id);
 
+    // Adjustments posted to the ledger: write-offs, applied credit notes,
+    // refunds and transfers — so the closing balance matches what is owed.
+    const ADJUSTMENTS = {
+      WRITE_OFF:             { type: 'Write-off',    side: 'credit', prefix: 'WO' },
+      CREDIT_NOTE_APPLIED:   { type: 'Credit Note',  side: 'credit', prefix: 'CN' },
+      INTERNAL_TRANSFER_IN:  { type: 'Transfer In',  side: 'credit', prefix: 'TR' },
+      REFUND:                { type: 'Refund',       side: 'debit',  prefix: 'RF' },
+      INTERNAL_TRANSFER_OUT: { type: 'Transfer Out', side: 'debit',  prefix: 'TR' },
+    };
+    const orgId = getOrgId(req);
+    const ledgerQ = db('edx_transaction_ledger as tl')
+      .where({ 'tl.org_id': orgId, 'tl.status': 'COMPLETED' })
+      .whereIn('tl.transaction_type', Object.keys(ADJUSTMENTS))
+      .select('tl.id', 'tl.booking_id', 'tl.created_on as date', 'tl.transaction_type',
+        'tl.amount', 'tl.reference_id', 'tl.description');
+    if (booking_id) ledgerQ.where('tl.booking_id', booking_id);
+    if (user_id) {
+      ledgerQ.whereIn('tl.booking_id', db('edx_bookings').select('id').where({ org_id: orgId, user_id }));
+    }
+
     const invoices = await invoiceQ;
     const receipts = await receiptQ;
+    const adjustments = (await ledgerQ).map((l) => {
+      const a = ADJUSTMENTS[l.transaction_type];
+      const amt = round2(l.amount);
+      return {
+        id: l.id,
+        booking_id: l.booking_id,
+        date: l.date,
+        type: a.type,
+        debit: a.side === 'debit' ? amt : 0,
+        credit: a.side === 'credit' ? amt : 0,
+        reference_number: l.reference_id != null ? `${a.prefix}-${l.reference_id}` : a.type,
+        description: l.description || a.type,
+      };
+    });
 
     // Merge and sort by date ascending
-    const transactions = [...invoices, ...receipts].sort((a, b) =>
+    const transactions = [...invoices, ...receipts, ...adjustments].sort((a, b) =>
       new Date(a.date || 0) - new Date(b.date || 0)
     );
 
     // Compute running balance
     let balance = 0;
     const result = transactions.map((t) => {
-      balance += Number(t.debit) - Number(t.credit);
+      balance = round2(balance + Number(t.debit) - Number(t.credit));
       return { ...t, balance };
     });
 
@@ -378,17 +498,21 @@ const createWriteOff = async (req, res) => {
       write_off_date,
     } = req.body;
 
-    if (!write_off_amount) {
-      return res.status(400).json(errBody('write_off_amount is required.'));
+    const amount = parseMoney(write_off_amount);
+    if (amount === null) {
+      return res.status(400).json(errBody('write_off_amount is required and must be a number.'));
     }
-
-    if (Number(write_off_amount) <= 0) {
+    if (amount <= 0) {
       return res.status(400).json(errBody('write_off_amount must be greater than zero.'));
+    }
+    // Without a booking there is no balance to cap the write-off against.
+    if (!booking_id) {
+      return res.status(400).json(errBody('booking_id is required.'));
     }
 
     const orgId = getOrgId(req);
 
-    if (booking_id) {
+    {
       // The booking must belong to the caller's org — otherwise this would
       // reveal (and write off against) another tenant's balance.
       const ownBooking = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first('id', 'user_id');
@@ -407,16 +531,13 @@ const createWriteOff = async (req, res) => {
         ));
       }
 
-      // Guard: write-off cannot exceed outstanding balance
-      const totalBilledRow = await db('edx_invoice')
-        .where({ booking_id, org_id: orgId }).sum('inv_raised_amnt as total_billed').first();
-      const totalPaidRow = await db('edx_receipts')
-        .where({ booking_id, org_id: orgId, status: 'Approved' }).sum('total_amount as total_paid').first();
-      const outstanding = (Number(totalBilledRow.total_billed) || 0) - (Number(totalPaidRow.total_paid) || 0);
-      if (Number(write_off_amount) > outstanding) {
+      // Guard: write-off cannot exceed the outstanding balance — net of
+      // earlier write-offs, applied credit notes, transfers and refunds.
+      const { outstandingAmount: outstanding } = await _computeOutstanding(orgId, { bookingId: booking_id });
+      if (amount > outstanding + MONEY_EPS) {
         return res.status(400).json(errBody(
-          `Write-off amount (₹${Number(write_off_amount).toFixed(2)}) exceeds outstanding balance (₹${outstanding.toFixed(2)}).`,
-          { outstanding },
+          `Write-off amount (₹${fmt2(amount)}) exceeds outstanding balance (₹${fmt2(Math.max(0, outstanding))}).`,
+          { outstanding: round2(outstanding) },
         ));
       }
     }
@@ -424,10 +545,12 @@ const createWriteOff = async (req, res) => {
     const [id] = await db('edx_write_offs').insert(withOrg(req, {
       booking_id:      booking_id      || null,
       user_id:         user_id         || null,
-      write_off_amount: Number(write_off_amount),
+      write_off_amount: round2(amount),
       reason:          reason          || null,
       remarks:         remarks         || null,
-      approved_by:     approved_by     || null,
+      // Set to the real approver when the write-off is approved — never the
+      // name the creator typed.
+      approved_by:     null,
       write_off_date:  write_off_date  || getCurrentDateTime(),
       status:          'Pending',
       created_by:      req.login_data.id,
@@ -477,21 +600,17 @@ const updateWriteOffStatus = async (req, res) => {
       return res.status(403).json(errBody('You cannot approve a write-off you created.'));
     }
 
-    const updated = await db('edx_write_offs')
-      .where({ id, status: 'Pending' })
-      .andWhere('org_id', getOrgId(req))
-      .update({
-        status,
-        updated_by: req.login_data.id,
-        updated_on: getCurrentDateTime(),
-      });
-
-    if (!updated) {
-      return res.status(404).json(errBody('Write-off not found.'));
+    // Same transaction as approveWriteOff: posts the WRITE_OFF ledger entry,
+    // records the real approver and re-checks the outstanding balance.
+    if (status === 'Approved') {
+      await _approveWriteOffTx(getOrgId(req), req.login_data.id, writeOff.id);
+    } else if (!(await _rejectWriteOff(getOrgId(req), req.login_data.id, writeOff.id))) {
+      return res.status(409).json(errBody('Write-off was already processed.'));
     }
 
     res.json({ message: `Write-off ${status.toLowerCase()} successfully.` });
   } catch (err) {
+    if (err instanceof StateConflict) return res.status(err.status).json(errBody(err.message));
     logger.error(`Error updateWriteOffStatus: ${err.message}`);
     res.status(500).json(errBody('An error occurred while updating write-off status.'));
   }
@@ -508,23 +627,17 @@ const getInvoices = async (req, res) => {
   try {
     const user = req.login_data;
     const orgId = getOrgId(req);
-    const today = new Date().toISOString().split('T')[0];
+    const today = formatLocalDate(new Date());
 
+    // paid / balance / status are worked out per invoice below (see
+    // _invoiceAllocations) — a booking's receipts are not credited to every
+    // one of its invoices.
     let query = db('edx_invoice as i')
       .leftJoin('edx_bookings as b',        'i.booking_id', 'b.id')
       .leftJoin('edx_client_app_users as u',   'b.user_id', 'u.id')
       .leftJoin('edx_patient as p',         'b.patient_id', 'p.id')
       .leftJoin('edx_master_services as ms','b.service_type_id', 'ms.id')
       .leftJoin('edx_branches as br',       'b.branch_id', 'br.br_id')
-      .leftJoin(
-        db('edx_receipts')
-          .select('booking_id')
-          .sum('total_amount as total_paid')
-          .where('status', 'Approved')
-          .groupBy('booking_id')
-          .as('rec'),
-        'rec.booking_id', 'b.id'
-      )
       .where('b.org_id', orgId)
       .select(
         'i.id as invoice_db_id',
@@ -536,8 +649,6 @@ const getInvoices = async (req, res) => {
         'i.inv_date  as invoice_date',
         'i.due_date',
         'i.invoice_type',
-        db.raw('COALESCE(rec.total_paid, 0) as paid_amount'),
-        db.raw('COALESCE(i.inv_raised_amnt, 0) - COALESCE(rec.total_paid, 0) as balance_due'),
         'b.final_rate as daily_rate',
         'b.status    as booking_status',
         'u.user_name   as client_name',
@@ -545,21 +656,6 @@ const getInvoices = async (req, res) => {
         'p.patient_name',
         'ms.name as service_name',
         'br.br_name as branch_name',
-        db.raw(`
-          CASE
-            WHEN COALESCE(i.inv_raised_amnt,0) > 0
-              AND COALESCE(rec.total_paid,0) >= COALESCE(i.inv_raised_amnt,0)
-              THEN 'Paid'
-            WHEN COALESCE(rec.total_paid,0) > 0
-              AND COALESCE(rec.total_paid,0) < COALESCE(i.inv_raised_amnt,0)
-              THEN 'Partially Paid'
-            WHEN i.due_date IS NOT NULL
-              AND i.due_date < '${today}'
-              AND COALESCE(rec.total_paid,0) = 0
-              THEN 'Overdue'
-            ELSE 'Pending'
-          END as status
-        `)
       );
 
     // Apply branch filter from JWT
@@ -570,10 +666,22 @@ const getInvoices = async (req, res) => {
     if (req.query.from)        query = query.where('i.inv_date', '>=', req.query.from);
     if (req.query.to)          query = query.where('i.inv_date', '<=', req.query.to);
 
-    // Status filter applied as HAVING on computed column — use subquery trick
-    const results = await query.orderBy('i.id', 'desc');
+    const rows = await query.orderBy('i.id', 'desc');
 
-    // Apply status filter in JS (simpler than HAVING on computed expression)
+    const alloc = await _invoiceAllocations(db, rows.map((r) => r.booking_id));
+    const results = rows.map((r) => {
+      const a = alloc.get(String(r.invoice_db_id))
+        || { amount: round2(r.total_amount), paid: 0, credited: 0, balance: round2(r.total_amount) };
+      return {
+        ...r,
+        paid_amount:     a.paid,
+        credited_amount: a.credited,
+        balance_due:     a.balance,
+        status:          invoiceStatus(a, r.due_date, today),
+      };
+    });
+
+    // Status filter on the computed status
     const finalResults = req.query.status
       ? results.filter(r => r.status === req.query.status)
       : results;
@@ -601,7 +709,11 @@ const createCreditNote = async (req, res) => {
     if (!booking_id || !amount) {
       return res.status(400).json(errBody('booking_id and amount are required.'));
     }
-    if (!(Number(amount) > 0)) return res.status(400).json(errBody('amount must be greater than zero.'));
+    const cnAmount = parseMoney(amount);
+    if (cnAmount === null || cnAmount <= 0) return res.status(400).json(errBody('amount must be greater than zero.'));
+    if (credit_type && !CREDIT_TYPES.includes(credit_type)) {
+      return res.status(400).json(enumError('credit_type', CREDIT_TYPES));
+    }
 
     const orgId = getOrgId(req);
     const cnBooking = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first('id', 'user_id');
@@ -615,7 +727,7 @@ const createCreditNote = async (req, res) => {
       booking_id,
       invoice_id:  invoice_id  || null,
       credit_type: credit_type || 'Hold',
-      amount:      Number(amount),
+      amount:      round2(cnAmount),
       reason:      reason      || null,
       status:      'Pending',
       credit_date: credit_date || getCurrentDateTime(),
@@ -715,11 +827,17 @@ const updateCreditNoteStatus = async (req, res) => {
       ));
     }
 
+    // Maker-checker, as for write-offs and refunds: an approved credit note
+    // reduces what the client owes, so its creator may not approve it.
+    if (status === 'Approved' && _isOwnRequest(creditNote, req.login_data.id)) {
+      return res.status(403).json(errBody('You cannot approve a credit note you created.'));
+    }
+
     const updated = await db('edx_credit_notes')
-      .where({ id })
+      .where({ id, status: 'Pending' })
       .andWhere('org_id', getOrgId(req))
       .update({ status, updated_by: req.login_data.id, updated_on: getCurrentDateTime() });
-    if (!updated) return res.status(404).json(errBody('Credit note not found.'));
+    if (!updated) return res.status(409).json(errBody('Credit note was already processed.'));
     res.json({ message: `Credit note ${status.toLowerCase()}.` });
   } catch (err) {
     logger.error(`Error updateCreditNoteStatus: ${err.message}`);
@@ -737,30 +855,18 @@ const updateCreditNoteStatus = async (req, res) => {
 const getAgingReport = async (req, res) => {
   try {
     const orgId = getOrgId(req);
-    const today = new Date().toISOString().split('T')[0];
+    const today = parseLocalDate(formatLocalDate(new Date()));
 
-    // Fetch all unpaid / partially paid invoices
-    const invoices = await db('edx_invoice as i')
+    // Every invoice of the org, with its own open balance (receipts and
+    // applied credit notes allocated per invoice — see _invoiceAllocations).
+    const allInvoices = await db('edx_invoice as i')
       .leftJoin('edx_bookings as b', 'i.booking_id', 'b.id')
-      .leftJoin(
-        db('edx_receipts')
-          .select('booking_id')
-          .sum('total_amount as total_paid')
-          .where('status', 'Approved')
-          .groupBy('booking_id')
-          .as('rec'),
-        'rec.booking_id', 'b.id'
-      )
       .where('b.org_id', orgId)
-      .whereRaw('COALESCE(i.inv_raised_amnt,0) > COALESCE(rec.total_paid,0)')
-      .select(
-        'i.id',
-        'i.booking_id',
-        'i.inv_raised_amnt as total_amount',
-        'i.due_date',
-        db.raw('COALESCE(rec.total_paid,0) as paid_amount'),
-        db.raw('COALESCE(i.inv_raised_amnt,0) - COALESCE(rec.total_paid,0) as balance_due'),
-      );
+      .select('i.id', 'i.booking_id', 'i.inv_raised_amnt as total_amount', 'i.due_date');
+    const alloc = await _invoiceAllocations(db, allInvoices.map((i) => i.booking_id));
+    const invoices = allInvoices
+      .map((i) => ({ ...i, balance_due: alloc.get(String(i.id))?.balance ?? round2(i.total_amount) }))
+      .filter((i) => i.balance_due > MONEY_EPS);
 
     const buckets = {
       current:   { label: 'Current (Not Due)', count: 0, amount: 0 },
@@ -775,11 +881,8 @@ const getAgingReport = async (req, res) => {
       if (balance <= 0) return;
 
       let overdueDays = 0;
-      if (inv.due_date) {
-        const due = new Date(inv.due_date);
-        const now = new Date(today);
-        overdueDays = Math.ceil((now - due) / (1000 * 60 * 60 * 24));
-      }
+      const due = parseLocalDate(inv.due_date);
+      if (due) overdueDays = Math.round((today - due) / 86400000);
 
       if (overdueDays <= 0) {
         buckets.current.count++;
@@ -802,7 +905,7 @@ const getAgingReport = async (req, res) => {
     // Round amounts
     Object.values(buckets).forEach(b => { b.amount = Math.round(b.amount * 100) / 100; });
 
-    res.json({ buckets, total_outstanding: invoices.reduce((s, i) => s + Number(i.balance_due), 0) });
+    res.json({ buckets, total_outstanding: round2(invoices.reduce((s, i) => s + Number(i.balance_due), 0)) });
   } catch (err) {
     logger.error(`Error getAgingReport: ${err.message}`);
     res.status(500).json(errBody('An error occurred while fetching aging report.'));
@@ -836,31 +939,33 @@ const getCollectionsKPIs = async (req, res) => {
       .first();
     const totalCollected = Number(collectedRow.total_collected) || 0;
 
-    // Overdue invoices
-    const today = new Date().toISOString().split('T')[0];
-    const overdueRows = await db('edx_invoice as i')
+    // Overdue = past due with an open balance — the same rule as the
+    // 'Overdue' status in getInvoices, using per-invoice balances.
+    const today = formatLocalDate(new Date());
+    const invoices = await db('edx_invoice as i')
       .leftJoin('edx_bookings as b', 'i.booking_id', 'b.id')
-      .leftJoin(
-        db('edx_receipts')
-          .select('booking_id').sum('total_amount as tp')
-          .where('status', 'Approved').groupBy('booking_id').as('r'),
-        'r.booking_id', 'b.id'
-      )
       .where('b.org_id', orgId)
-      .whereNotNull('i.due_date')
-      .whereRaw(`i.due_date < ?`, [today])
-      .whereRaw(`COALESCE(i.inv_raised_amnt,0) > COALESCE(r.tp,0)`)
-      .select(
-        db.raw('COUNT(*) as overdue_count'),
-        db.raw('SUM(COALESCE(i.inv_raised_amnt,0) - COALESCE(r.tp,0)) as overdue_amount'),
-      )
-      .first();
+      .select('i.id', 'i.booking_id', 'i.inv_raised_amnt', 'i.due_date');
+    const alloc = await _invoiceAllocations(db, invoices.map((i) => i.booking_id));
+    let overdueCount = 0;
+    let overdueAmount = 0;
+    for (const inv of invoices) {
+      const a = alloc.get(String(inv.id));
+      if (a && invoiceStatus(a, inv.due_date, today) === 'Overdue') {
+        overdueCount++;
+        overdueAmount += a.balance;
+      }
+    }
 
-    const overdueCount  = Number(overdueRows.overdue_count)  || 0;
-    const overdueAmount = Number(overdueRows.overdue_amount) || 0;
+    // Outstanding nets write-offs, applied credit notes, transfers and
+    // refunds, like the client / booking outstanding endpoints.
+    const ledgerRow = await db('edx_transaction_ledger')
+      .where({ org_id: orgId, status: 'COMPLETED' })
+      .select(db.raw(`${LEDGER_NET_CREDIT_SQL} as net_credit`))
+      .first();
+    const totalOutstanding = round2(totalBilled - totalCollected - (Number(ledgerRow?.net_credit) || 0));
 
     // DSO = (Total Receivables / Total Billed) * 30  (30-day DSO approximation)
-    const totalOutstanding = totalBilled - totalCollected;
     const dso = totalBilled > 0
       ? Math.round((totalOutstanding / totalBilled) * 30)
       : 0;
@@ -888,8 +993,12 @@ const getCollectionsKPIs = async (req, res) => {
 
 /**
  * POST /api/bulkGenerateInvoices
- * Generates invoices for all active bookings (status=4) that have no invoice
- * for the current calendar month.
+ * Invoices the days of the month that active bookings (status=4) have not been
+ * billed for yet. Bookings are invoiced for their whole period at activation
+ * and on extension, so only days no existing invoice covers are billed (one
+ * invoice per uncovered stretch). Each booking is handled in its own
+ * transaction with the booking row locked, so concurrent runs or double clicks
+ * cannot bill the same days twice.
  * Body: { month, year, payment_terms_days }  (optional overrides)
  */
 const bulkGenerateInvoices = async (req, res) => {
@@ -897,9 +1006,15 @@ const bulkGenerateInvoices = async (req, res) => {
     const orgId  = getOrgId(req);
     const userId = req.login_data.id;
     const now    = new Date();
-    const month  = parseInt(req.body.month  || now.getMonth() + 1);
-    const year   = parseInt(req.body.year   || now.getFullYear());
-    const paymentTermsDays = parseInt(req.body.payment_terms_days || 15);
+    const month  = parseInt(req.body.month  || now.getMonth() + 1, 10);
+    const year   = parseInt(req.body.year   || now.getFullYear(), 10);
+    const paymentTermsDays = parseInt(req.body.payment_terms_days ?? 15, 10);
+    if (!(month >= 1 && month <= 12) || !(year >= 2000 && year <= 2100)) {
+      return res.status(400).json(errBody('month must be 1–12 and year a valid year.'));
+    }
+    if (!(paymentTermsDays >= 0)) {
+      return res.status(400).json(errBody('payment_terms_days must be 0 or more.'));
+    }
 
     // Guard: period must not be closed
     const closedPeriod = await db('edx_period_closing')
@@ -911,68 +1026,78 @@ const bulkGenerateInvoices = async (req, res) => {
       ));
     }
 
-    // Month start/end strings
-    const monthStr  = String(month).padStart(2, '0');
-    const monthStart = `${year}-${monthStr}-01`;
-    const lastDay   = new Date(year, month, 0).getDate();
-    const monthEnd  = `${year}-${monthStr}-${lastDay}`;
+    const monthStr   = String(month).padStart(2, '0');
+    const monthStart = new Date(year, month - 1, 1);
+    const monthEnd   = new Date(year, month, 0);
 
-    // Find active bookings that don't already have an invoice for this month
-    const existingInvBookingIds = (await db('edx_invoice as i')
-      .leftJoin('edx_bookings as b', 'i.booking_id', 'b.id')
-      .where('b.org_id', orgId)
-      .whereRaw(`i.inv_start >= ? AND i.inv_start <= ?`, [monthStart, monthEnd])
-      .select('i.booking_id'))
-      .map(r => r.booking_id);
-
-    let bookingsQ = db('edx_bookings')
+    const bookings = await db('edx_bookings')
       .where({ org_id: orgId, status: '4' })  // Active
       .whereNotNull('final_rate')
       .select('id', 'final_rate', 'service_start_date', 'service_end_date', 'user_id');
-
-    if (existingInvBookingIds.length > 0) {
-      bookingsQ = bookingsQ.whereNotIn('id', existingInvBookingIds);
-    }
-
-    const bookings = await bookingsQ;
 
     if (bookings.length === 0) {
       return res.json({ message: 'No bookings need invoicing this month.', generated: 0 });
     }
 
     let generated = 0;
-    const dueDate = new Date(now);
-    dueDate.setDate(dueDate.getDate() + paymentTermsDays);
-    const dueDateStr = dueDate.toISOString().split('T')[0];
+    const dueDateStr = formatLocalDate(
+      new Date(now.getFullYear(), now.getMonth(), now.getDate() + paymentTermsDays));
 
     for (const booking of bookings) {
       try {
-        // Clamp service period to current month
-        const sStart = new Date(Math.max(new Date(booking.service_start_date), new Date(monthStart)));
-        const sEnd   = new Date(Math.min(new Date(booking.service_end_date || monthEnd), new Date(monthEnd)));
-        if (sEnd < sStart) continue;
+        const rate  = Number(booking.final_rate);
+        const start = parseLocalDate(booking.service_start_date);
+        if (!(rate > 0) || !start) continue;
+        // Open-ended bookings run to the end of the month.
+        const end  = parseLocalDate(booking.service_end_date) || monthEnd;
+        const from = start > monthStart ? start : monthStart;
+        const to   = end < monthEnd ? end : monthEnd;
+        if (to < from) continue;
 
-        const totalDays = Math.ceil((sEnd - sStart) / (1000 * 60 * 60 * 24)) + 1;
-        const invAmount = totalDays * parseFloat(booking.final_rate || 0);
+        generated += await withTransaction(async (trx) => {
+          const locked = await trx('edx_bookings')
+            .where({ id: booking.id, org_id: orgId })
+            .forUpdate()
+            .first('id');
+          if (!locked) return 0;
 
-        await db('edx_invoice').insert(withOrg(req, {
-          booking_id:      booking.id,
-          inv_raised_amnt: invAmount,
-          inv_start:       sStart.toISOString().split('T')[0],
-          inv_end:         sEnd.toISOString().split('T')[0],
-          inv_date:        getCurrentDateTime(),
-          due_date:        dueDateStr,
-          invoice_type:    'Regular',
-          created_by:      userId,
-          created_on:      getCurrentDateTime(),
-        }));
-        generated++;
+          // Dates are VARCHAR in mixed formats — compare in JS. An invoice with
+          // no end date is treated as covering the whole month (never bill
+          // twice when unsure).
+          const existing = await trx('edx_invoice')
+            .where({ booking_id: booking.id })
+            .select('inv_start', 'inv_end');
+          const covered = existing
+            .map((i) => ({ start: parseLocalDate(i.inv_start), end: parseLocalDate(i.inv_end) || to }))
+            .filter((c) => c.start);
+
+          const gaps = uncoveredSegments(from, to, covered);
+          for (const gap of gaps) {
+            await trx('edx_invoice').insert(withOrg(req, {
+              booking_id:      booking.id,
+              inv_raised_amnt: round2(gap.days * rate),
+              inv_start:       formatLocalDate(gap.start),
+              inv_end:         formatLocalDate(gap.end),
+              inv_date:        getCurrentDateTime(),
+              due_date:        dueDateStr,
+              invoice_type:    'Regular',
+              created_by:      userId,
+              created_on:      getCurrentDateTime(),
+            }));
+          }
+          return gaps.length;
+        });
       } catch (rowErr) {
         logger.warn(`[bulkInvoice] booking #${booking.id} skipped: ${rowErr.message}`);
       }
     }
 
-    res.json({ message: `${generated} invoice(s) generated for ${monthStr}/${year}.`, generated });
+    res.json({
+      message: generated
+        ? `${generated} invoice(s) generated for ${monthStr}/${year}.`
+        : 'No bookings need invoicing this month.',
+      generated,
+    });
   } catch (err) {
     logger.error(`Error bulkGenerateInvoices: ${err.message}`);
     res.status(500).json(errBody('An error occurred during bulk invoice generation.'));
@@ -988,8 +1113,11 @@ const bulkGenerateInvoices = async (req, res) => {
  */
 const closePeriod = async (req, res) => {
   try {
-    const { month, year } = req.body;
-    if (!month || !year) return res.status(400).json(errBody('month and year are required.'));
+    const month = parseInt(req.body.month, 10);
+    const year  = parseInt(req.body.year, 10);
+    if (!(month >= 1 && month <= 12) || !(year >= 2000 && year <= 2100)) {
+      return res.status(400).json(errBody('month (1–12) and year are required.'));
+    }
     const orgId = getOrgId(req);
 
     const existing = await db('edx_period_closing')
@@ -1011,6 +1139,9 @@ const closePeriod = async (req, res) => {
 
     res.json({ message: `Period ${month}/${year} closed successfully.` });
   } catch (err) {
+    if (err && err.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json(errBody('This period is already closed.'));
+    }
     logger.error(`Error closePeriod: ${err.message}`);
     res.status(500).json(errBody('An error occurred while closing period.'));
   }
@@ -1048,8 +1179,9 @@ const getRevenueRecognition = async (req, res) => {
   try {
     const orgId = getOrgId(req);
     const today = new Date();
-    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1).toISOString().split('T')[0];
-    const monthEnd   = new Date(today.getFullYear(), today.getMonth() + 1, 0).toISOString().split('T')[0];
+    // Local calendar dates — toISOString() is a day behind in IST.
+    const monthStart = formatLocalDate(new Date(today.getFullYear(), today.getMonth(), 1));
+    const monthEnd   = formatLocalDate(new Date(today.getFullYear(), today.getMonth() + 1, 0));
 
     // Active bookings
     const activeBookings = await db('edx_bookings')
@@ -1066,7 +1198,7 @@ const getRevenueRecognition = async (req, res) => {
     const deferredRows = await db('edx_invoice as i')
       .leftJoin('edx_bookings as b', 'i.booking_id', 'b.id')
       .where('b.org_id', orgId)
-      .where('i.inv_start', '>', today.toISOString().split('T')[0])
+      .where('i.inv_start', '>', formatLocalDate(today))
       .sum('i.inv_raised_amnt as deferred')
       .first();
     const deferred = Number(deferredRows.deferred) || 0;
@@ -1124,14 +1256,26 @@ const createInsuranceClaim = async (req, res) => {
   try {
     const { booking_id, user_id, tpa_name, policy_number, pre_auth_number, claim_amount, remarks } = req.body;
     if (!booking_id) return res.status(400).json(errBody('booking_id is required.'));
+    const amount = parseMoney(claim_amount);
+    if (amount === null || amount <= 0) {
+      return res.status(400).json(errBody('claim_amount must be a number greater than zero.'));
+    }
+
+    // The booking must be this org's — otherwise the claims list would expose
+    // another tenant's client and patient details.
+    const booking = await db('edx_bookings').where({ id: booking_id, org_id: getOrgId(req) }).first('id', 'user_id');
+    if (!booking) return res.status(404).json(errBody('Booking not found.'));
+    if (disagrees(user_id, booking.user_id)) {
+      return res.status(400).json(errBody('user_id does not match the booking client.'));
+    }
 
     const [id] = await db('edx_insurance_claims').insert(withOrg(req, {
       booking_id,
-      user_id:        user_id        || null,
+      user_id:        booking.user_id,
       tpa_name:       tpa_name       || null,
       policy_number:  policy_number  || null,
       pre_auth_number:pre_auth_number|| null,
-      claim_amount:   claim_amount   ? Number(claim_amount) : null,
+      claim_amount:   round2(amount),
       remarks:        remarks        || null,
       status:         'Pending',
       created_by:     req.login_data.id,
@@ -1160,21 +1304,42 @@ const updateInsuranceClaim = async (req, res) => {
       return res.status(400).json(errBody(`status must be one of: ${validStatuses.join(', ')}`));
     }
 
+    const claim = await db('edx_insurance_claims').where({ id, org_id: getOrgId(req) }).first();
+    if (!claim) return res.status(404).json(errBody('Claim not found.'));
+
+    // Claims move forward only; Rejected and Settled are final.
+    const transitions = {
+      Pending:   ['Pending', 'Submitted', 'Rejected'],
+      Submitted: ['Submitted', 'Approved', 'Rejected'],
+      Approved:  ['Approved', 'Settled'],
+    };
+    if (!(transitions[claim.status] || []).includes(status)) {
+      return res.status(400).json(errBody(`A ${claim.status} claim cannot be moved to ${status}.`));
+    }
+
     const updateData = {
       status,
       remarks:     remarks     || undefined,
       updated_by:  req.login_data.id,
       updated_on:  getCurrentDateTime(),
     };
-    if (settled_amount !== undefined) updateData.settled_amount = Number(settled_amount);
+    if (status === 'Settled' || settled_amount !== undefined) {
+      const settled = parseMoney(settled_amount);
+      const cap = parseMoney(claim.claim_amount);
+      if (settled === null || settled <= 0 || (cap !== null && settled > cap + MONEY_EPS)) {
+        return res.status(400).json(errBody(
+          `settled_amount must be more than zero and at most the claim amount${cap !== null ? ` (₹${fmt2(cap)})` : ''}.`));
+      }
+      updateData.settled_amount = round2(settled);
+    }
     if (settled_date)                 updateData.settled_date   = settled_date;
 
     const updated = await db('edx_insurance_claims')
-      .where({ id })
+      .where({ id, status: claim.status })
       .andWhere('org_id', getOrgId(req))
       .update(updateData);
 
-    if (!updated) return res.status(404).json(errBody('Claim not found.'));
+    if (!updated) return res.status(409).json(errBody('Claim was updated by someone else. Refresh and try again.'));
     res.json({ message: `Claim updated to ${status}.` });
   } catch (err) {
     logger.error(`Error updateInsuranceClaim: ${err.message}`);
@@ -1187,9 +1352,15 @@ const updateInsuranceClaim = async (req, res) => {
  */
 const getInsuranceClaims = async (req, res) => {
   try {
+    // Joins are org-scoped: a claim can never surface another tenant's
+    // booking, client or patient.
     let query = db('edx_insurance_claims as ic')
-      .leftJoin('edx_bookings as b',       'ic.booking_id', 'b.id')
-      .leftJoin('edx_client_app_users as u',  'b.user_id', 'u.id')
+      .leftJoin('edx_bookings as b', function () {
+        this.on('ic.booking_id', 'b.id').andOn('b.org_id', 'ic.org_id');
+      })
+      .leftJoin('edx_client_app_users as u', function () {
+        this.on('b.user_id', 'u.id').andOn('u.org_id', 'ic.org_id');
+      })
       .leftJoin('edx_patient as p',        'b.patient_id', 'p.id')
       .where('ic.org_id', getOrgId(req))
       .select(
@@ -1240,42 +1411,33 @@ const getCancellationBilling = async (req, res) => {
 
     if (!booking) return res.status(404).json(errBody('Booking not found.'));
 
-    const cancelDate = cancel_date || new Date().toISOString().split('T')[0];
-    const startDate  = booking.service_start_date;
-    const finalRate  = parseFloat(booking.final_rate) || 0;
+    const cancelDate = parseLocalDate(cancel_date) ? cancel_date : formatLocalDate(new Date());
 
-    // Days actually used
-    const start    = new Date(startDate);
-    const end      = new Date(cancelDate);
-    const daysUsed = start <= end ? Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1 : 0;
-    const amountDue = daysUsed * finalRate;
-
-    // Total paid so far
-    const paidRow = await db('edx_receipts')
-      .where({ booking_id, org_id: getOrgId(req), status: 'Approved' })
-      .sum('total_amount as total_paid')
-      .first();
-    const totalPaid = Number(paidRow.total_paid) || 0;
-
-    const balance    = amountDue - totalPaid;
-    const refundable = balance < 0 ? Math.abs(balance) : 0;
-    const owing      = balance > 0 ? balance : 0;
+    // Same calculation cancelUserService settles with: against what was
+    // invoiced, net of refunds already paid out.
+    const st = await computeCancellationSettlement(db, { booking, orgId: getOrgId(req), cancelDate });
+    if (!st) return res.status(400).json(errBody('This booking has no valid start date or daily rate to bill.'));
 
     res.json({
-      booking_id:      parseInt(booking_id),
-      client_name:     booking.client_name,
-      patient_name:    booking.patient_name,
-      service_name:    booking.service_name,
-      service_start:   startDate,
-      cancel_date:     cancelDate,
-      daily_rate:      finalRate,
-      days_used:       daysUsed,
-      amount_due:      Math.round(amountDue * 100) / 100,
-      total_paid:      totalPaid,
-      balance:         Math.round(balance * 100) / 100,
-      refundable:      Math.round(refundable * 100) / 100,  // client overpaid
-      owing:           Math.round(owing     * 100) / 100,   // client still owes
-      action_required: balance > 0 ? 'RAISE_INVOICE' : balance < 0 ? 'PROCESS_REFUND' : 'SETTLED',
+      booking_id:         parseInt(booking_id),
+      client_name:        booking.client_name,
+      patient_name:       booking.patient_name,
+      service_name:       booking.service_name,
+      service_start:      booking.service_start_date,
+      cancel_date:        cancelDate,
+      daily_rate:         st.daily_rate,
+      days_used:          st.days_used,
+      amount_due:         st.amount_due,
+      total_billed:       st.total_billed,
+      total_paid:         st.total_paid,
+      total_refunded:     st.total_refunded,
+      invoice_amount:     st.invoice_amount,       // extra invoice on cancel
+      credit_note_amount: st.credit_note_amount,   // credit for unused, billed days
+      balance:            st.balance,
+      refundable:         st.refundable,           // client overpaid
+      owing:              st.owing,                // client still owes
+      action_required:    st.balance > MONEY_EPS ? 'RAISE_INVOICE'
+        : st.balance < -MONEY_EPS ? 'PROCESS_REFUND' : 'SETTLED',
     });
   } catch (err) {
     logger.error(`Error getCancellationBilling: ${err.message}`);
@@ -1296,6 +1458,10 @@ const createPaymentLink = async (req, res) => {
     const { invoice_id, amount } = req.body;
     if (!invoice_id || !amount) {
       return res.status(400).json(errBody('invoice_id and amount are required.'));
+    }
+    const linkAmount = parseMoney(amount);
+    if (linkAmount === null || linkAmount <= 0) {
+      return res.status(400).json(errBody('amount must be a number greater than zero.'));
     }
     const orgId  = getOrgId(req);
     const userId = req.login_data.id;
@@ -1328,7 +1494,7 @@ const createPaymentLink = async (req, res) => {
         const rzp = new Razorpay({ key_id: RAZORPAY_KEY_ID, key_secret: RAZORPAY_KEY_SECRET });
 
         const payLink = await rzp.paymentLink.create({
-          amount:      Math.round(Number(amount) * 100), // paise
+          amount:      Math.round(linkAmount * 100), // paise
           currency:    'INR',
           description: `Invoice #${invoice_id} — Eldivex`,
           customer: {
@@ -1476,7 +1642,7 @@ const razorpayWebhook = async (req, res) => {
         total_amount:   amountINR,
         payment_mode:   'Online',
         transaction_id: paymentId,
-        receipt_date:   new Date().toISOString().split('T')[0],
+        receipt_date:   formatLocalDate(new Date()),
         status:         'Approved',
         receipt_type:   'Payment',
         org_id:         orgId,
@@ -1550,7 +1716,9 @@ const getReceipts = async (req, res) => {
       .where('r.org_id', getOrgId(req))
       .select(
         'r.*',
-        db.raw("CONCAT('REC-', r.id) as receipt_number"),
+        // The number on the receipt the client was emailed; REC-<id> only
+        // for legacy rows that never got one.
+        db.raw("COALESCE(NULLIF(r.receipt_number, ''), CONCAT('REC-', r.id)) as receipt_number"),
         'u.user_name   as client_name',
         'u.phone_number as client_mobile',
         'p.patient_name',
@@ -1615,47 +1783,6 @@ const getWriteOffs = async (req, res) => {
 
 // ── Internal Helpers ─────────────────────────────────────────────────────────
 
-async function _createTransactionEntry(trxOrDb, { orgId, clientId, bookingId, invoiceId, transactionType, direction, amount, referenceId, referenceType, description, notes, createdBy }) {
-  const clientRows = await trxOrDb('edx_transaction_ledger')
-    .where({ org_id: orgId, client_id: clientId, status: 'COMPLETED' })
-    .sum({ total_debit: trxOrDb.raw('CASE WHEN direction="DEBIT" THEN amount ELSE 0 END') })
-    .sum({ total_credit: trxOrDb.raw('CASE WHEN direction="CREDIT" THEN amount ELSE 0 END') })
-    .first();
-  const prevClientBalance = (parseFloat(clientRows.total_debit) || 0) - (parseFloat(clientRows.total_credit) || 0);
-  const newClientBalance = direction === 'DEBIT' ? prevClientBalance + amount : prevClientBalance - amount;
-
-  let newBookingBalance = null;
-  if (bookingId) {
-    const bkRows = await trxOrDb('edx_transaction_ledger')
-      .where({ org_id: orgId, booking_id: bookingId, status: 'COMPLETED' })
-      .sum({ total_debit: trxOrDb.raw('CASE WHEN direction="DEBIT" THEN amount ELSE 0 END') })
-      .sum({ total_credit: trxOrDb.raw('CASE WHEN direction="CREDIT" THEN amount ELSE 0 END') })
-      .first();
-    const prevBkBalance = (parseFloat(bkRows.total_debit) || 0) - (parseFloat(bkRows.total_credit) || 0);
-    newBookingBalance = direction === 'DEBIT' ? prevBkBalance + amount : prevBkBalance - amount;
-  }
-
-  const [id] = await trxOrDb('edx_transaction_ledger').insert({
-    org_id: orgId,
-    client_id: clientId,
-    booking_id: bookingId || null,
-    invoice_id: invoiceId || null,
-    transaction_type: transactionType,
-    direction,
-    amount,
-    reference_id: referenceId || null,
-    reference_type: referenceType || null,
-    status: 'COMPLETED',
-    description: description || null,
-    notes: notes || null,
-    running_balance_client: newClientBalance,
-    running_balance_booking: newBookingBalance,
-    created_by: createdBy || null,
-    created_on: getCurrentDateTime(),
-  });
-  return id;
-}
-
 // Thrown inside a transaction when the locked row is no longer in the state
 // the request expects (a concurrent approval won the race).
 class StateConflict extends Error {
@@ -1709,6 +1836,8 @@ const getTransactionLedger = async (req, res) => {
     const countQ = db('edx_transaction_ledger').where('org_id', orgId);
     if (booking_id) countQ.where('booking_id', booking_id);
     if (client_id) countQ.where('client_id', client_id);
+    if (from_date) countQ.where('created_on', '>=', from_date);
+    if (to_date) countQ.where('created_on', '<=', to_date + ' 23:59:59');
     const [{ total }] = await countQ.count('id as total');
     return res.json({ data, total, limit: parseInt(limit), offset: parseInt(offset) });
   } catch (err) {
@@ -1836,25 +1965,45 @@ const createWriteOffV2 = async (req, res) => {
     const { booking_id, user_id, write_off_type = 'BAD_DEBT', invoice_ids = [], write_off_amount, reason, remarks } = req.body;
 
     if (!booking_id || !write_off_amount || !reason) return res.status(400).json(errBody('booking_id, write_off_amount and reason are required'));
-    const amount = parseFloat(write_off_amount);
-    if (isNaN(amount) || amount <= 0) return res.status(400).json(errBody('write_off_amount must be a positive number'));
+    const amount = parseMoney(write_off_amount);
+    if (amount === null || amount <= 0) return res.status(400).json(errBody('write_off_amount must be a positive number'));
+    if (!WRITE_OFF_TYPES.includes(write_off_type)) return res.status(400).json(enumError('write_off_type', WRITE_OFF_TYPES));
 
     const booking = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first();
     if (!booking) return res.status(404).json(errBody('Booking not found'));
     if (booking.status == 6) return res.status(400).json(errBody('Cannot write off a cancelled booking'));
+    if (disagrees(user_id, booking.user_id)) return res.status(400).json(errBody('user_id does not match the booking client'));
 
     const existing = await db('edx_write_offs').where({ booking_id, org_id: orgId, status: 'Pending' }).first();
     if (existing) return res.status(400).json(errBody('A pending write-off already exists for this booking'));
+
+    // Invoices named on the write-off must be this booking's.
+    const invoiceIds = Array.isArray(invoice_ids) ? invoice_ids.filter((v) => v !== null && v !== '') : [];
+    if (invoiceIds.length) {
+      const own = await db('edx_invoice').where({ booking_id, org_id: orgId }).whereIn('id', invoiceIds).select('id');
+      if ((own || []).length !== new Set(invoiceIds.map(String)).size) {
+        return res.status(400).json(errBody('invoice_ids must all belong to this booking'));
+      }
+    }
+
+    // Cap at what the booking still owes (net of earlier adjustments).
+    const { outstandingAmount } = await _computeOutstanding(orgId, { bookingId: booking_id });
+    if (amount > outstandingAmount + MONEY_EPS) {
+      return res.status(400).json(errBody(
+        `Write-off amount (₹${fmt2(amount)}) exceeds outstanding balance (₹${fmt2(Math.max(0, outstandingAmount))}).`,
+        { outstanding: round2(outstandingAmount) },
+      ));
+    }
 
     const approvalLevel = _determineApprovalLevel(amount);
     const now = getCurrentDateTime();
 
     const [id] = await db('edx_write_offs').insert(withOrg(req, {
       booking_id,
-      user_id: user_id || booking.user_id,
-      write_off_amount: amount,
+      user_id: booking.user_id,
+      write_off_amount: round2(amount),
       write_off_type,
-      invoice_ids: JSON.stringify(invoice_ids),
+      invoice_ids: JSON.stringify(invoiceIds),
       reason,
       remarks: remarks || null,
       approval_level: approvalLevel,
@@ -1882,6 +2031,63 @@ const createWriteOffV2 = async (req, res) => {
 
 // ── approveWriteOff ──────────────────────────────────────────────────────────
 
+/**
+ * Approves a Pending write-off in one transaction: locks the write-off and its
+ * booking, re-checks the booking still owes at least the write-off amount,
+ * posts the WRITE_OFF ledger entry and records the approver. Shared by
+ * approveWriteOff and the legacy updateWriteOffStatus, so both paths reach the
+ * ledger. Throws StateConflict (409 already processed, 400 over the balance).
+ */
+async function _approveWriteOffTx(orgId, userId, writeOffId, notes) {
+  return withTransaction(async (trx) => {
+    const locked = await trx('edx_write_offs').where({ id: writeOffId, org_id: orgId }).forUpdate().first();
+    if (!locked || locked.status !== 'Pending') throw new StateConflict('Write-off was already processed.');
+    const booking = locked.booking_id
+      ? await trx('edx_bookings').where({ id: locked.booking_id, org_id: orgId }).forUpdate().first()
+      : null;
+
+    const amount = round2(locked.write_off_amount);
+    if (locked.booking_id) {
+      const { outstandingAmount } = await _computeOutstanding(orgId, { bookingId: locked.booking_id }, trx);
+      if (amount > outstandingAmount + MONEY_EPS) {
+        throw new StateConflict(
+          `Write-off ₹${fmt2(amount)} exceeds the booking's outstanding balance of ₹${fmt2(Math.max(0, outstandingAmount))}.`,
+          400,
+        );
+      }
+    }
+
+    const entryId = await _createTransactionEntry(trx, {
+      orgId, clientId: locked.user_id || booking?.user_id, bookingId: locked.booking_id,
+      transactionType: 'WRITE_OFF', direction: 'CREDIT',
+      amount,
+      referenceId: locked.id, referenceType: 'WRITE_OFF',
+      description: 'Write-off approved: ' + locked.reason,
+      createdBy: userId,
+    });
+    await trx('edx_write_offs').where({ id: locked.id, org_id: orgId }).update({
+      status: 'Approved', approved_by: String(userId),
+      transaction_entry_id: entryId, updated_by: userId, updated_on: getCurrentDateTime(),
+    });
+    await _addApprovalHistory(trx, {
+      orgId, referenceType: 'WRITE_OFF', referenceId: locked.id,
+      action: 'APPROVED', actionBy: userId, notes,
+      approvalLevel: locked.approval_level === 'L1' ? 1 : locked.approval_level === 'L2' ? 2 : 3,
+    });
+  });
+}
+
+// Rejects a Pending write-off; false when it was no longer Pending.
+async function _rejectWriteOff(orgId, userId, writeOffId, notes) {
+  const changed = await db('edx_write_offs').where({ id: writeOffId, org_id: orgId, status: 'Pending' })
+    .update({ status: 'Rejected', updated_by: userId, updated_on: getCurrentDateTime() });
+  if (!changed) return false;
+  await _addApprovalHistory(db, {
+    orgId, referenceType: 'WRITE_OFF', referenceId: writeOffId, action: 'REJECTED', actionBy: userId, notes,
+  });
+  return true;
+}
+
 const approveWriteOff = async (req, res) => {
   try {
     const orgId = getOrgId(req);
@@ -1897,39 +2103,10 @@ const approveWriteOff = async (req, res) => {
       return res.status(403).json(errBody('You cannot approve a write-off you created.'));
     }
 
-    const now = getCurrentDateTime();
-
     if (action === 'Approved') {
-      await withTransaction(async (trx) => {
-        // Re-read under a row lock so two approvers cannot both post the ledger entry.
-        const locked = await trx('edx_write_offs').where({ id: wo.id, org_id: orgId }).forUpdate().first();
-        if (!locked || locked.status !== 'Pending') throw new StateConflict('Write-off was already processed.');
-        const booking = await trx('edx_bookings').where({ id: locked.booking_id, org_id: orgId }).first();
-        const entryId = await _createTransactionEntry(trx, {
-          orgId, clientId: locked.user_id || booking?.user_id, bookingId: locked.booking_id,
-          transactionType: 'WRITE_OFF', direction: 'CREDIT',
-          amount: parseFloat(locked.write_off_amount),
-          referenceId: locked.id, referenceType: 'WRITE_OFF',
-          description: 'Write-off approved: ' + locked.reason,
-          createdBy: userId,
-        });
-        await trx('edx_write_offs').where('id', wo.id).update({
-          status: 'Approved', approved_by: String(userId),
-          transaction_entry_id: entryId, updated_by: userId, updated_on: now,
-        });
-        await _addApprovalHistory(trx, {
-          orgId, referenceType: 'WRITE_OFF', referenceId: wo.id,
-          action: 'APPROVED', actionBy: userId, notes,
-          approvalLevel: wo.approval_level === 'L1' ? 1 : wo.approval_level === 'L2' ? 2 : 3,
-        });
-      });
-    } else {
-      const changed = await db('edx_write_offs').where({ id: wo.id, org_id: orgId, status: 'Pending' })
-        .update({ status: 'Rejected', updated_by: userId, updated_on: now });
-      if (!changed) return res.status(409).json(errBody('Write-off was already processed.'));
-      await _addApprovalHistory(db, {
-        orgId, referenceType: 'WRITE_OFF', referenceId: wo.id, action: 'REJECTED', actionBy: userId, notes,
-      });
+      await _approveWriteOffTx(orgId, userId, wo.id, notes);
+    } else if (!(await _rejectWriteOff(orgId, userId, wo.id, notes))) {
+      return res.status(409).json(errBody('Write-off was already processed.'));
     }
 
     const updated = await db('edx_write_offs').where('id', wo.id).first();
@@ -1942,7 +2119,56 @@ const approveWriteOff = async (req, res) => {
   }
 };
 
+/**
+ * Per-invoice amount / paid / credited / balance for the given bookings, via
+ * allocateInvoicePayments: receipts linked to an invoice pay it first,
+ * unlinked receipts are spread FIFO by inv_start, applied credit notes reduce
+ * their invoice. `bookingIds` must already be scoped to the caller's org.
+ * Returns Map(String(invoice id) → { amount, paid, credited, balance }).
+ */
+async function _invoiceAllocations(conn, bookingIds) {
+  const ids = [...new Set((bookingIds || []).filter((v) => v != null))];
+  if (!ids.length) return new Map();
+  const invoices = await conn('edx_invoice').whereIn('booking_id', ids)
+    .select('id', 'booking_id', 'inv_start', 'inv_raised_amnt');
+  const receipts = await conn('edx_receipts').whereIn('booking_id', ids).where('status', 'Approved')
+    .select('booking_id', 'invoice_id', 'total_amount');
+  const invoiceIds = (invoices || []).map((i) => i.id);
+  const applications = invoiceIds.length
+    ? await conn('edx_credit_note_applications').whereIn('target_invoice_id', invoiceIds).where('status', 'APPLIED')
+      .select('target_invoice_id', 'amount_applied')
+    : [];
+  return allocateInvoicePayments(invoices || [], receipts || [], applications || []);
+}
+
 // ── createRefund ─────────────────────────────────────────────────────────────
+
+/**
+ * Money a booking can still refund: approved receipts + credit transferred in
+ * − credit transferred out − refunds already committed (pending approval,
+ * approved, processing or completed). Pass `excludeRefundId` when checking a
+ * refund that is itself in that set.
+ */
+async function _refundableBalance(conn, orgId, bookingId, excludeRefundId = null) {
+  const sum = async (q, col) => Number((await q.sum(`${col} as total`).first())?.total) || 0;
+  const paid = await sum(
+    conn('edx_receipts').where({ booking_id: bookingId, org_id: orgId, status: 'Approved' }), 'total_amount');
+  const refundsQ = conn('edx_refunds').where({ booking_id: bookingId, org_id: orgId })
+    .whereIn('status', REFUND_COMMITTED_STATUSES);
+  if (excludeRefundId != null) refundsQ.where('id', '<>', excludeRefundId);
+  const committed = await sum(refundsQ, 'refund_amount');
+  const transfers = await conn('edx_transaction_ledger')
+    .where({ booking_id: bookingId, org_id: orgId, status: 'COMPLETED' })
+    .whereIn('transaction_type', ['INTERNAL_TRANSFER_IN', 'INTERNAL_TRANSFER_OUT'])
+    .select('transaction_type', conn.raw('SUM(amount) as total'))
+    .groupBy('transaction_type');
+  let transferNet = 0;
+  for (const t of transfers || []) {
+    const amt = Number(t.total) || 0;
+    transferNet += t.transaction_type === 'INTERNAL_TRANSFER_IN' ? amt : -amt;
+  }
+  return round2(paid + transferNet - committed);
+}
 
 const createRefund = async (req, res) => {
   try {
@@ -1953,26 +2179,47 @@ const createRefund = async (req, res) => {
     if (!booking_id || !refund_amount || !refund_channel || !refund_reason) {
       return res.status(400).json(errBody('booking_id, refund_amount, refund_channel, refund_reason are required'));
     }
-    const amount = parseFloat(refund_amount);
-    if (isNaN(amount) || amount <= 0) return res.status(400).json(errBody('refund_amount must be positive'));
+    const amount = parseMoney(refund_amount);
+    if (amount === null || amount <= 0) return res.status(400).json(errBody('refund_amount must be positive'));
+    if (!REFUND_CHANNELS.includes(refund_channel)) return res.status(400).json(enumError('refund_channel', REFUND_CHANNELS));
+    if (!REFUND_REASONS.includes(refund_reason)) return res.status(400).json(enumError('refund_reason', REFUND_REASONS));
 
     const booking = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first();
     if (!booking) return res.status(404).json(errBody('Booking not found'));
+    if (disagrees(client_id, booking.user_id)) return res.status(400).json(errBody('client_id does not match the booking client'));
 
-    const paidRows = await db('edx_receipts').where({ booking_id, org_id: orgId, status: 'Approved' }).sum('total_amount as total').first();
-    const alreadyRefunded = await db('edx_refunds').where({ booking_id, org_id: orgId }).whereIn('status', ['APPROVED', 'PROCESSING', 'COMPLETED']).sum('refund_amount as total').first();
-    const maxRefund = (parseFloat(paidRows?.total) || 0) - (parseFloat(alreadyRefunded?.total) || 0);
-    if (amount > maxRefund) return res.status(400).json(errBody('Refund amount exceeds refundable balance of ' + maxRefund));
+    // The invoice and receipts named on the refund must be this booking's.
+    if (invoice_id) {
+      const inv = await db('edx_invoice').where({ id: invoice_id, booking_id, org_id: orgId }).first('id');
+      if (!inv) return res.status(400).json(errBody('invoice_id does not belong to this booking'));
+    }
+    const receiptIds = Array.isArray(receipt_ids) ? receipt_ids.filter((v) => v !== null && v !== '') : [];
+    if (receiptIds.length) {
+      const own = await db('edx_receipts').where({ booking_id, org_id: orgId }).whereIn('id', receiptIds).select('id');
+      if ((own || []).length !== new Set(receiptIds.map(String)).size) {
+        return res.status(400).json(errBody('receipt_ids must all belong to this booking'));
+      }
+    }
+
+    // Refundable = what was paid in, net of transfers and of refunds already
+    // committed — including ones still awaiting approval.
+    const maxRefund = await _refundableBalance(db, orgId, booking_id);
+    if (amount > maxRefund + MONEY_EPS) {
+      return res.status(400).json(errBody(
+        `Refund amount exceeds the refundable balance of ₹${fmt2(Math.max(0, maxRefund))}`,
+        { refundable: round2(Math.max(0, maxRefund)) },
+      ));
+    }
 
     const approvalLevel = _determineApprovalLevel(amount);
     const now = getCurrentDateTime();
 
     const [id] = await db('edx_refunds').insert(withOrg(req, {
-      client_id: client_id || booking.user_id,
+      client_id: booking.user_id,
       booking_id,
       invoice_id: invoice_id || null,
-      receipt_ids: JSON.stringify(receipt_ids),
-      refund_amount: amount,
+      receipt_ids: JSON.stringify(receiptIds),
+      refund_amount: round2(amount),
       refund_channel,
       refund_reason,
       channel_details: JSON.stringify(channel_details),
@@ -2007,11 +2254,17 @@ const getRefunds = async (req, res) => {
     const { booking_id, status, from_date, to_date } = req.query;
     let q = db('edx_refunds as r')
       .leftJoin('edx_bookings as b', 'b.id', 'r.booking_id')
-      .leftJoin('edx_client_app_users as u', 'u.id', 'r.client_id')
+      .leftJoin('edx_client_app_users as u', function () {
+        this.on('u.id', 'r.client_id').andOn('u.org_id', 'r.org_id');
+      })
+      .leftJoin('edx_web_app_users as rq', 'rq.id', 'r.requested_by')
+      .leftJoin('edx_web_app_users as ap', 'ap.id', 'r.approved_by')
       .where('r.org_id', orgId)
       .select('r.*',
         db.raw("IFNULL(u.user_name, '') as client_name"),
-        db.raw("CONCAT('BK-', LPAD(b.id, 6, '0')) as booking_ref")
+        db.raw("CONCAT('BK-', LPAD(b.id, 6, '0')) as booking_ref"),
+        db.raw("IFNULL(rq.user_name, '') as requested_by_name"),
+        db.raw("IFNULL(ap.user_name, '') as approved_by_name")
       )
       .orderBy('r.id', 'desc');
     if (booking_id) q = q.where('r.booking_id', booking_id);
@@ -2034,11 +2287,17 @@ const getRefundById = async (req, res) => {
     const { id } = req.params;
     const refund = await db('edx_refunds as r')
       .leftJoin('edx_bookings as b', 'b.id', 'r.booking_id')
-      .leftJoin('edx_client_app_users as u', 'u.id', 'r.client_id')
+      .leftJoin('edx_client_app_users as u', function () {
+        this.on('u.id', 'r.client_id').andOn('u.org_id', 'r.org_id');
+      })
+      .leftJoin('edx_web_app_users as rq', 'rq.id', 'r.requested_by')
+      .leftJoin('edx_web_app_users as ap', 'ap.id', 'r.approved_by')
       .where('r.id', id).where('r.org_id', orgId)
       .select('r.*',
         db.raw("IFNULL(u.user_name, '') as client_name"),
-        db.raw("CONCAT('BK-', LPAD(b.id, 6, '0')) as booking_ref")
+        db.raw("CONCAT('BK-', LPAD(b.id, 6, '0')) as booking_ref"),
+        db.raw("IFNULL(rq.user_name, '') as requested_by_name"),
+        db.raw("IFNULL(ap.user_name, '') as approved_by_name")
       ).first();
     if (!refund) return res.status(404).json(errBody('Refund not found'));
     const history = await db('edx_approval_history').where({ reference_type: 'REFUND', reference_id: id, org_id: orgId }).orderBy('id');
@@ -2074,7 +2333,27 @@ const approveRefund = async (req, res) => {
     let historyAction = action === 'Approved' ? 'APPROVED' : action === 'Rejected' ? 'REJECTED' : 'APPROVED';
 
     if (action === 'Approved') {
-      Object.assign(updates, { status: 'APPROVED', approved_by: userId, approved_at: now });
+      // Re-check the refundable balance with the booking locked, so two
+      // pending refunds can't both be approved past what was paid.
+      await withTransaction(async (trx) => {
+        await trx('edx_bookings').where({ id: refund.booking_id, org_id: orgId }).forUpdate().first('id');
+        const available = await _refundableBalance(trx, orgId, refund.booking_id, refund.id);
+        const amt = round2(refund.refund_amount);
+        if (amt > available + MONEY_EPS) {
+          throw new StateConflict(
+            `Refund ₹${fmt2(amt)} exceeds the refundable balance of ₹${fmt2(Math.max(0, available))}.`, 400);
+        }
+        const changed = await trx('edx_refunds')
+          .where({ id: refund.id, org_id: orgId, status: 'PENDING_APPROVAL' })
+          .update({ ...updates, status: 'APPROVED', approved_by: userId, approved_at: now });
+        if (!changed) throw new StateConflict('Refund was already processed.');
+        await _addApprovalHistory(trx, {
+          orgId, referenceType: 'REFUND', referenceId: refund.id, action: 'APPROVED', actionBy: userId, notes,
+        });
+      });
+      const updated = await db('edx_refunds').where('id', refund.id).first();
+      const history = await db('edx_approval_history').where({ reference_type: 'REFUND', reference_id: refund.id, org_id: orgId }).orderBy('id');
+      return res.json({ ...updated, approval_history: history });
     } else if (action === 'Rejected') {
       Object.assign(updates, { status: 'REJECTED' });
       historyAction = 'REJECTED';
@@ -2148,6 +2427,14 @@ const applyCreditNote = async (req, res) => {
     const targetBooking = await db('edx_bookings').where({ id: target_booking_id, org_id: orgId }).first();
     if (!targetBooking) return res.status(404).json(errBody('Target booking not found'));
 
+    // A client's credit can only settle that same client's invoices.
+    if (cn.booking_id != null) {
+      const cnBooking = await db('edx_bookings').where({ id: cn.booking_id, org_id: orgId }).first('user_id');
+      if (cnBooking && String(cnBooking.user_id) !== String(targetBooking.user_id)) {
+        return res.status(400).json(errBody('The credit note belongs to a different client'));
+      }
+    }
+
     let applicationId;
     await withTransaction(async (trx) => {
       // Balance is re-read under a row lock: two concurrent applications must
@@ -2157,6 +2444,15 @@ const applyCreditNote = async (req, res) => {
       const lockedRemaining = parseFloat(locked.remaining_amount ?? locked.amount);
       if (!(lockedRemaining >= applyAmt)) {
         throw new StateConflict('Amount exceeds credit note remaining balance of ' + lockedRemaining, 400);
+      }
+
+      // Never credit an invoice past what is still open on it (after its
+      // receipts and earlier credit-note applications).
+      await trx('edx_invoice').where({ id: target_invoice_id }).forUpdate().first('id');
+      const alloc = await _invoiceAllocations(trx, [targetBooking.id]);
+      const open = alloc.get(String(target_invoice_id))?.balance ?? 0;
+      if (applyAmt > open + MONEY_EPS) {
+        throw new StateConflict(`Amount exceeds the invoice's open balance of ₹${fmt2(Math.max(0, open))}`, 400);
       }
       const newRemaining = lockedRemaining - applyAmt;
       const newUsed = (parseFloat(locked.used_amount) || 0) + applyAmt;
@@ -2217,6 +2513,30 @@ const getCreditNoteApplications = async (req, res) => {
 
 // ── createInternalTransfer ───────────────────────────────────────────────────
 
+// Transfers that move a credit balance (vs. moving money paid in).
+const CREDIT_TRANSFER_TYPES = ['OVERPAYMENT_TRANSFER', 'CREDIT_BALANCE_TRANSFER'];
+
+/**
+ * How much may still be transferred out of a booking: its credit balance for
+ * credit transfers, or the money paid into it (net of refunds and transfers)
+ * for receipt reallocations / service switches — minus other transfers out of
+ * it still awaiting approval.
+ */
+async function _transferableFromBooking(conn, orgId, bookingId, transferType, excludeTransferId = null) {
+  const pendingQ = conn('edx_internal_transfers')
+    .where({ source_booking_id: bookingId, org_id: orgId, status: 'PENDING_APPROVAL' });
+  if (excludeTransferId != null) pendingQ.where('id', '<>', excludeTransferId);
+  const pending = Number((await pendingQ.sum('transfer_amount as total').first())?.total) || 0;
+  let base;
+  if (CREDIT_TRANSFER_TYPES.includes(transferType)) {
+    const { outstandingAmount } = await _computeOutstanding(orgId, { bookingId }, conn);
+    base = -outstandingAmount;
+  } else {
+    base = await _refundableBalance(conn, orgId, bookingId);
+  }
+  return round2(base - pending);
+}
+
 const createInternalTransfer = async (req, res) => {
   try {
     const orgId = getOrgId(req);
@@ -2227,8 +2547,9 @@ const createInternalTransfer = async (req, res) => {
     }
     if (source_booking_id == target_booking_id) return res.status(400).json(errBody('Source and target bookings must be different'));
 
-    const amount = parseFloat(transfer_amount);
-    if (isNaN(amount) || amount <= 0) return res.status(400).json(errBody('transfer_amount must be positive'));
+    const amount = parseMoney(transfer_amount);
+    if (amount === null || amount <= 0) return res.status(400).json(errBody('transfer_amount must be positive'));
+    if (!TRANSFER_TYPES.includes(transfer_type)) return res.status(400).json(enumError('transfer_type', TRANSFER_TYPES));
 
     const [srcBk, tgtBk] = await Promise.all([
       db('edx_bookings').where({ id: source_booking_id, org_id: orgId }).first(),
@@ -2237,13 +2558,23 @@ const createInternalTransfer = async (req, res) => {
     if (!srcBk) return res.status(404).json(errBody('Source booking not found'));
     if (!tgtBk) return res.status(404).json(errBody('Target booking not found'));
     if (srcBk.user_id != tgtBk.user_id) return res.status(400).json(errBody('Both bookings must belong to the same client'));
+    if (disagrees(client_id, srcBk.user_id)) return res.status(400).json(errBody('client_id does not match the bookings\' client'));
+
+    // Never move more than the source booking actually has to give.
+    const available = await _transferableFromBooking(db, orgId, source_booking_id, transfer_type);
+    if (amount > available + MONEY_EPS) {
+      return res.status(400).json(errBody(
+        `Transfer amount exceeds what the source booking can transfer (₹${fmt2(Math.max(0, available))}).`,
+        { available: round2(Math.max(0, available)) },
+      ));
+    }
 
     const now = getCurrentDateTime();
     const [id] = await db('edx_internal_transfers').insert(withOrg(req, {
-      client_id,
+      client_id: srcBk.user_id,
       source_booking_id,
       target_booking_id,
-      transfer_amount: amount,
+      transfer_amount: round2(amount),
       transfer_type,
       reason,
       notes: notes || null,
@@ -2274,10 +2605,16 @@ const getInternalTransfers = async (req, res) => {
     let q = db('edx_internal_transfers as t')
       .leftJoin('edx_bookings as sb', 'sb.id', 't.source_booking_id')
       .leftJoin('edx_bookings as tb', 'tb.id', 't.target_booking_id')
-      .leftJoin('edx_client_app_users as u', 'u.id', 't.client_id')
+      .leftJoin('edx_client_app_users as u', function () {
+        this.on('u.id', 't.client_id').andOn('u.org_id', 't.org_id');
+      })
+      .leftJoin('edx_web_app_users as rq', 'rq.id', 't.requested_by')
+      .leftJoin('edx_web_app_users as ap', 'ap.id', 't.approved_by')
       .where('t.org_id', orgId)
       .select('t.*',
         db.raw("IFNULL(u.user_name, '') as client_name"),
+        db.raw("IFNULL(rq.user_name, '') as requested_by_name"),
+        db.raw("IFNULL(ap.user_name, '') as approved_by_name"),
         db.raw("CONCAT('BK-', LPAD(sb.id, 6, '0')) as source_booking_ref"),
         db.raw("CONCAT('BK-', LPAD(tb.id, 6, '0')) as target_booking_ref")
       ).orderBy('t.id', 'desc');
@@ -2314,6 +2651,15 @@ const approveInternalTransfer = async (req, res) => {
       await withTransaction(async (trx) => {
         const locked = await trx('edx_internal_transfers').where({ id: transfer.id, org_id: orgId }).forUpdate().first();
         if (!locked || locked.status !== 'PENDING_APPROVAL') throw new StateConflict('Transfer was already processed.');
+        // Re-check with the source booking locked: its balance may have
+        // changed since the request was raised.
+        await trx('edx_bookings').where({ id: locked.source_booking_id, org_id: orgId }).forUpdate().first('id');
+        const available = await _transferableFromBooking(
+          trx, orgId, locked.source_booking_id, locked.transfer_type, locked.id);
+        if (round2(locked.transfer_amount) > available + MONEY_EPS) {
+          throw new StateConflict(
+            `Transfer exceeds what the source booking can transfer (₹${fmt2(Math.max(0, available))}).`, 400);
+        }
         const outEntryId = await _createTransactionEntry(trx, {
           orgId, clientId: transfer.client_id, bookingId: transfer.source_booking_id,
           transactionType: 'INTERNAL_TRANSFER_OUT', direction: 'DEBIT',

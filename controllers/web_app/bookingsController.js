@@ -14,6 +14,7 @@ const { notifyOrgAdmins } = require('../../utils/notify');
 const { getClientContact } = require('../../utils/clientContact');
 const { checkPlanLimit } = require('../../utils/planUsage');
 const { ENGAGED_BOOKING_STATUSES } = require('../../utils/bookingStatus');
+const { computeCancellationSettlement, parseLocalDate, formatLocalDate } = require('../../utils/accountsCalc');
 const { guardOrgHandlers } = require('../../utils/requestOrg');
 const crypto = require('crypto');
 
@@ -56,51 +57,6 @@ async function _createHoldCreditNote({ booking_id, from_date, to_date, inv_id, o
     logger.info(`[accounts] Hold credit note created for booking #${booking_id} — ₹${creditAmount}`);
   } catch (err) {
     logger.warn(`[accounts] _createHoldCreditNote failed: ${err.message}`);
-  }
-}
-
-/**
- * Compute cancellation billing summary for a booking.
- * Returns { days_used, amount_due, total_paid, balance, refundable, owing }
- */
-async function _computeCancellationBilling({ booking_id, cancel_date, org_id }) {
-  try {
-    if (org_id == null) return null;
-    const booking = await db('edx_bookings').where({ id: booking_id, org_id }).first();
-    if (!booking) return null;
-
-    const startDate  = booking.service_start_date;
-    const finalRate  = parseFloat(booking.final_rate) || parseFloat(booking.base_rate) || 0;
-    const cancelOn   = cancel_date || mysqlDateAddDays(0);
-
-    const start    = new Date(startDate);
-    const end      = new Date(cancelOn);
-
-    // Bail out on un-billable data instead of computing a bogus settlement.
-    // An invalid/missing start date would make daysUsed=0 → amount_due=0 →
-    // the entire paid amount would be flagged refundable and auto-written-off.
-    if (isNaN(start.getTime()) || isNaN(end.getTime()) || finalRate <= 0) {
-      logger.warn(`[accounts] Skipping cancellation billing for booking #${booking_id}: invalid start date or rate.`);
-      return null;
-    }
-
-    const daysUsed = start <= end ? Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1 : 0;
-    const amountDue = daysUsed * finalRate;
-
-    const paidRow = await db('edx_receipts')
-      .where({ booking_id, org_id, status: 'Approved' })
-      .sum('total_amount as total_paid')
-      .first();
-    const totalPaid = Number(paidRow?.total_paid) || 0;
-
-    const balance    = amountDue - totalPaid;
-    const refundable = balance < 0 ? Math.abs(balance) : 0;
-    const owing      = balance > 0 ? balance : 0;
-
-    return { days_used: daysUsed, daily_rate: finalRate, amount_due: amountDue, total_paid: totalPaid, balance, refundable, owing };
-  } catch (err) {
-    logger.warn(`[accounts] _computeCancellationBilling failed: ${err.message}`);
-    return null;
   }
 }
 
@@ -1065,31 +1021,76 @@ else if (status == 5) {
       const cancelTarget = await db('edx_bookings').where({ id: booking_id, org_id: orgId }).first('id', 'user_id');
       if (!cancelTarget) return res.status(404).json({ message: 'Booking not found.' });
 
-      await withTransaction(async (trx) => {
-        await trx('edx_service_closed').insert(withOrg(req, {
-          booking_id: booking_id || 'NA',
-          term_date: term_date || 'NA',
-          term_reason: term_reason || 'NA',
-          term_remarks: term_remarks || 'NA',
-          created_on: getCurrentDateTime(),
-          created_by: userId
-        }));
+      const cancelDate = parseLocalDate(term_date) ? term_date : formatLocalDate(new Date());
 
-        await trx('edx_bookings')
-          .where({ id: booking_id, org_id: getOrgId(req) })
-          .update({
-            status: '6',
-            updated_on: db.fn.now(),
-            updated_by: userId
-          });
-      });
+      // Cancel and settle once, in one transaction with the booking locked.
+      // Settlement is against what was already INVOICED (the booking was
+      // invoiced for its whole period up front): used days over the invoices
+      // → invoice the difference; invoices over the used days → a Pending
+      // 'Cancellation' credit note (normal maker-checker approval). Money the
+      // client overpaid shows as credit and goes back through createRefund.
+      let billingSummary;
+      try {
+        billingSummary = await withTransaction(async (trx) => {
+          const booking = await trx('edx_bookings').where({ id: booking_id, org_id: orgId }).forUpdate().first();
+          if (!booking || ['3', '6'].includes(String(booking.status))) {
+            throw Object.assign(new Error('Booking is already cancelled.'), { status: 409 });
+          }
 
-      // ── Compute cancellation billing (fire-and-forget) ──────────────────────
-      const billingSummary = await _computeCancellationBilling({
-        booking_id,
-        cancel_date: term_date || null,
-        org_id:      orgId,
-      });
+          // Computed from the booking as it was before cancelling.
+          const summary = await computeCancellationSettlement(trx, { booking, orgId, cancelDate });
+
+          await trx('edx_service_closed').insert(withOrg(req, {
+            booking_id: booking_id || 'NA',
+            term_date: term_date || 'NA',
+            term_reason: term_reason || 'NA',
+            term_remarks: term_remarks || 'NA',
+            created_on: getCurrentDateTime(),
+            created_by: userId
+          }));
+
+          await trx('edx_bookings')
+            .where({ id: booking_id, org_id: orgId })
+            .update({
+              status: '6',
+              updated_on: db.fn.now(),
+              updated_by: userId
+            });
+
+          if (summary && summary.invoice_amount > 0) {
+            await trx('edx_invoice').insert({
+              booking_id,
+              inv_raised_amnt: summary.invoice_amount,
+              inv_start:       cancelDate,
+              inv_end:         cancelDate,
+              inv_date:        getCurrentDateTime(),
+              due_date:        mysqlDateAddDays(7),
+              invoice_type:    'Regular',
+              org_id:          orgId,
+              created_by:      userId,
+              created_on:      getCurrentDateTime(),
+            });
+          }
+          if (summary && summary.credit_note_amount > 0) {
+            await trx('edx_credit_notes').insert({
+              booking_id,
+              invoice_id:  null,
+              credit_type: 'Cancellation',
+              amount:      summary.credit_note_amount,
+              reason:      `Unused days after cancellation${term_reason && term_reason !== 'NA' ? ` — ${term_reason}` : ''}`,
+              status:      'Pending',
+              credit_date: getCurrentDateTime(),
+              org_id:      orgId,
+              created_by:  userId,
+              created_on:  getCurrentDateTime(),
+            });
+          }
+          return summary;
+        });
+      } catch (cancelErr) {
+        if (cancelErr.status === 409) return res.status(409).json({ message: cancelErr.message });
+        throw cancelErr;
+      }
 
       res.status(201).json({
         message:          'Service cancelled successfully.',
@@ -1113,45 +1114,14 @@ else if (status == 5) {
         data:  { booking_id, route: 'bookings' },
       });
 
-      // ── Auto-create cancellation invoice or write-off trigger (fire-and-forget)
+      // ── Cancellation billing email (fire-and-forget; settlement is already
+      //    committed above) ─────────────────────────────────────────────────
       setImmediate(async () => {
         try {
           if (!billingSummary) return;
           const { owing, refundable } = billingSummary;
           // bookings.user_id is a CLIENT id → edx_client_app_users.
           const bookingData = await getClientContact(cancelTarget.user_id, orgId);
-
-          // If client owes more → raise cancellation invoice
-          if (owing > 0) {
-            await db('edx_invoice').insert({
-              booking_id,
-              inv_raised_amnt: owing,
-              inv_start:       term_date || getCurrentDateTime(),
-              inv_end:         term_date || getCurrentDateTime(),
-              inv_date:        getCurrentDateTime(),
-              due_date:        mysqlDateAddDays(7),
-              invoice_type:    'Regular',
-              org_id:          getOrgId(req),
-              created_by:      userId,
-              created_on:      getCurrentDateTime(),
-            });
-            logger.info(`[accounts] Cancellation invoice raised for booking #${booking_id}: ₹${owing}`);
-          }
-
-          // If client overpaid → auto-create pending write-off (refund trigger)
-          if (refundable > 0) {
-            await db('edx_write_offs').insert({
-              booking_id,
-              write_off_amount: refundable,
-              reason:          `Refund due to service cancellation — ${term_reason || ''}`,
-              status:          'Pending',
-              write_off_date:  getCurrentDateTime(),
-              org_id:          getOrgId(req),
-              created_by:      userId,
-              created_on:      getCurrentDateTime(),
-            });
-            logger.info(`[accounts] Refund write-off created for booking #${booking_id}: ₹${refundable}`);
-          }
 
           // Send cancellation billing email
           if (bookingData && bookingData.user_email) {

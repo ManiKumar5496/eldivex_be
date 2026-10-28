@@ -29,4 +29,24 @@ const ENGAGED_BOOKING_STATUSES = [BOOKING_STATUS.HP_ASSIGNED, BOOKING_STATUS.SER
 // Bookings that no longer count towards usage.
 const CANCELLED_BOOKING_STATUSES = [BOOKING_STATUS.BOOKING_CANCELLED, BOOKING_STATUS.SERVICE_CANCELLED];
 
-module.exports = { BOOKING_STATUS, ENGAGED_BOOKING_STATUSES, CANCELLED_BOOKING_STATUSES };
+// Display labels for the status codes (accounts / reports screens).
+const BOOKING_STATUS_LABELS = Object.freeze({
+  [BOOKING_STATUS.SUBMITTED]:         'Booking Submitted',
+  [BOOKING_STATUS.HP_ASSIGNED]:       'HP Assigned',
+  [BOOKING_STATUS.BOOKING_CANCELLED]: 'Booking Cancelled',
+  [BOOKING_STATUS.SERVICE_STARTED]:   'Service Started',
+  [BOOKING_STATUS.ON_HOLD]:           'Service On Hold',
+  [BOOKING_STATUS.SERVICE_CANCELLED]: 'Service Cancelled',
+  [BOOKING_STATUS.SUSPENDED]:         'Service Suspended',
+});
+
+const bookingStatusLabel = (status) =>
+  (status === null || status === undefined ? null : BOOKING_STATUS_LABELS[String(status).trim()]) || 'Unknown';
+
+module.exports = {
+  BOOKING_STATUS,
+  ENGAGED_BOOKING_STATUSES,
+  CANCELLED_BOOKING_STATUSES,
+  BOOKING_STATUS_LABELS,
+  bookingStatusLabel,
+};
