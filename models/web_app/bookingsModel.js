@@ -99,12 +99,15 @@ const applyBranchFilter = require('../../utils/applyBranchFilter');
 const orgOf = (login_data) => (login_data && login_data.is_owner !== true ? login_data.org_id ?? -1 : -1);
 
 // EXISTS clause for an open ticket on this booking whose category name matches
-// `pattern` (LIKE) inside the booking's own org.
+// `pattern` (LIKE) inside the booking's own org. Outer-query columns
+// (edx_bookings.*) must stay in WHERE: MySQL 5.7 rejects them in a subquery's
+// JOIN ... ON with "Unknown column ... in 'on clause'".
 const openTicketExists = (pattern) => `EXISTS (
   SELECT 1 FROM edx_support_requests t
-    JOIN edx_support_category c ON c.id = t.support_type_id AND c.org_id = edx_bookings.org_id
+    JOIN edx_support_category c ON c.id = t.support_type_id
    WHERE t.booking_details = edx_bookings.id
      AND t.org_id = edx_bookings.org_id
+     AND c.org_id = edx_bookings.org_id
      AND t.status = 1
      AND LOWER(c.name) LIKE '${pattern}')`;
 

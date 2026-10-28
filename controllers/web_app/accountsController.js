@@ -1717,6 +1717,35 @@ const getTransactionLedger = async (req, res) => {
   }
 };
 
+// ── Outstanding: billed / paid from source tables ────────────────────────────
+// Invoices and receipts are never posted to edx_transaction_ledger (only
+// write-offs, refunds, credit-note applications and transfers are), so billed
+// and paid come from edx_invoice / approved edx_receipts — the same figures
+// getActiveClients and the write-off guard use. Adjustments stay ledger-based.
+
+// Booking ids in scope: one client's bookings, or a single booking.
+const _outstandingBookingScope = (orgId, { clientId, bookingId }) => {
+  const q = db('edx_bookings').where('org_id', orgId).select('id');
+  if (clientId != null) q.where('user_id', clientId);
+  if (bookingId != null) q.where('id', bookingId);
+  return q;
+};
+
+async function _billedAndPaid(orgId, scope) {
+  const [inv, rec] = await Promise.all([
+    db('edx_invoice')
+      .whereIn('booking_id', _outstandingBookingScope(orgId, scope))
+      .sum('inv_raised_amnt as total')
+      .first(),
+    db('edx_receipts')
+      .whereIn('booking_id', _outstandingBookingScope(orgId, scope))
+      .where('status', 'Approved')
+      .sum('total_amount as total')
+      .first(),
+  ]);
+  return { billed: parseFloat(inv?.total) || 0, paid: parseFloat(rec?.total) || 0 };
+}
+
 // ── getClientOutstanding ─────────────────────────────────────────────────────
 
 const getClientOutstanding = async (req, res) => {
@@ -1737,8 +1766,8 @@ const getClientOutstanding = async (req, res) => {
       totals[r.transaction_type] = (totals[r.transaction_type] || 0) + parseFloat(r.total);
     });
 
-    const totalBilled = totals['INVOICE'] || 0;
-    const totalPaid = totals['RECEIPT'] || 0;
+    const { billed: totalBilled, paid: totalPaid } =
+      await _billedAndPaid(orgId, { clientId: parseInt(clientId) });
     const totalWriteOff = totals['WRITE_OFF'] || 0;
     const totalCreditNoteApplied = totals['CREDIT_NOTE_APPLIED'] || 0;
     const totalRefunded = totals['REFUND'] || 0;
@@ -1777,8 +1806,8 @@ const getBookingOutstanding = async (req, res) => {
     const totals = {};
     rows.forEach(r => { totals[r.transaction_type] = (totals[r.transaction_type] || 0) + parseFloat(r.total); });
 
-    const totalBilled = totals['INVOICE'] || 0;
-    const totalPaid = totals['RECEIPT'] || 0;
+    const { billed: totalBilled, paid: totalPaid } =
+      await _billedAndPaid(orgId, { bookingId: parseInt(bookingId) });
     const totalWriteOff = totals['WRITE_OFF'] || 0;
     const totalCreditNoteApplied = totals['CREDIT_NOTE_APPLIED'] || 0;
     const totalRefunded = totals['REFUND'] || 0;

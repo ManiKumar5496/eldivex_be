@@ -153,13 +153,28 @@ describe('getTransactionLedger', () => {
 // getClientOutstanding
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Outstanding endpoints read billed from edx_invoice, paid from approved
+ * edx_receipts and adjustments from edx_transaction_ledger. Routes each table
+ * to its own chain and records the chains so tests can inspect the scope.
+ */
+function outstandingDb({ ledger = [], billed = null, paid = null }) {
+  const chains = {};
+  db.mockImplementation((table) => {
+    let c;
+    if (table === 'edx_transaction_ledger') c = chain(ledger);
+    else if (table === 'edx_invoice') c = chain({ total: billed });
+    else if (table === 'edx_receipts') c = chain({ total: paid });
+    else c = chain([]);
+    (chains[table] = chains[table] || []).push(c);
+    return c;
+  });
+  return chains;
+}
+
 describe('getClientOutstanding', () => {
-  test('computes correct outstanding from ledger rows', async () => {
-    const rows = [
-      { transaction_type: 'INVOICE',  direction: 'DEBIT',  total: '1000' },
-      { transaction_type: 'RECEIPT',  direction: 'CREDIT', total: '500'  },
-    ];
-    db.mockReturnValueOnce(chain(rows));
+  test('billed and paid come from invoices and approved receipts', async () => {
+    outstandingDb({ billed: '1000', paid: '500' });
 
     const res = mockRes();
     await getClientOutstanding(mockReq({}, {}, { clientId: '7' }), res);
@@ -173,8 +188,73 @@ describe('getClientOutstanding', () => {
     );
   });
 
+  test('invoiced client with no ledger entries is still outstanding', async () => {
+    // Regression: invoices are never posted to the ledger, so a client billed
+    // ₹15,600 used to show "No Balance Due".
+    outstandingDb({ billed: '15600', paid: null });
+
+    const res = mockRes();
+    await getClientOutstanding(mockReq({}, {}, { clientId: '7' }), res);
+
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ totalBilled: 15600, totalPaid: 0, outstandingAmount: 15600 })
+    );
+  });
+
+  test('applies ledger adjustments on top of billed and paid', async () => {
+    outstandingDb({
+      billed: '1000',
+      paid: '500',
+      ledger: [
+        { transaction_type: 'WRITE_OFF',           direction: 'CREDIT', total: '100' },
+        { transaction_type: 'CREDIT_NOTE_APPLIED', direction: 'CREDIT', total: '50'  },
+        { transaction_type: 'REFUND',              direction: 'DEBIT',  total: '20'  },
+      ],
+    });
+
+    const res = mockRes();
+    await getClientOutstanding(mockReq({}, {}, { clientId: '7' }), res);
+
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        totalWriteOff: 100,
+        totalCreditNoteApplied: 50,
+        totalRefunded: 20,
+        outstandingAmount: 370, // 1000 - 500 - 100 - 50 + 20
+      })
+    );
+  });
+
+  test('ignores INVOICE/RECEIPT ledger rows so nothing is double counted', async () => {
+    outstandingDb({
+      billed: '1000',
+      paid: '0',
+      ledger: [{ transaction_type: 'INVOICE', direction: 'DEBIT', total: '1000' }],
+    });
+
+    const res = mockRes();
+    await getClientOutstanding(mockReq({}, {}, { clientId: '7' }), res);
+
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({ totalBilled: 1000, outstandingAmount: 1000 })
+    );
+  });
+
+  test('scopes invoices and receipts to the client\'s bookings in the org', async () => {
+    const chains = outstandingDb({ billed: '0', paid: '0' });
+
+    await getClientOutstanding(mockReq({}, {}, { clientId: '7' }), mockRes());
+
+    expect(chains.edx_bookings).toHaveLength(2);
+    for (const scope of chains.edx_bookings) {
+      expect(scope.where).toHaveBeenCalledWith('org_id', 1);
+      expect(scope.where).toHaveBeenCalledWith('user_id', 7);
+    }
+    expect(chains.edx_receipts[0].where).toHaveBeenCalledWith('status', 'Approved');
+  });
+
   test('returns zero outstanding when no entries', async () => {
-    db.mockReturnValueOnce(chain([]));
+    outstandingDb({});
 
     const res = mockRes();
     await getClientOutstanding(mockReq({}, {}, { clientId: '7' }), res);
@@ -202,11 +282,7 @@ describe('getClientOutstanding', () => {
 
 describe('getBookingOutstanding', () => {
   test('returns outstanding for booking', async () => {
-    const rows = [
-      { transaction_type: 'INVOICE',  direction: 'DEBIT',  total: '2000' },
-      { transaction_type: 'RECEIPT',  direction: 'CREDIT', total: '800'  },
-    ];
-    db.mockReturnValueOnce(chain(rows));
+    const chains = outstandingDb({ billed: '2000', paid: '800' });
 
     const res = mockRes();
     await getBookingOutstanding(mockReq({}, {}, { bookingId: '42' }), res);
@@ -219,6 +295,9 @@ describe('getBookingOutstanding', () => {
         totalPaid: 800,
       })
     );
+    for (const scope of chains.edx_bookings) {
+      expect(scope.where).toHaveBeenCalledWith('id', 42);
+    }
   });
 
   test('returns 500 on db error', async () => {

@@ -31,8 +31,64 @@
 
   <title>Eldivex</title>
   <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#F2F4F7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0B0F17" media="(prefers-color-scheme: dark)">
+
+  <!-- Boot splash: shown until Flutter paints its first frame. Colours match
+       the app canvas (AppColor.cAppBackgroundColor) in light and dark. -->
+  <style>
+    :root { --bg: #F2F4F7; --track: #E5E7EB; --bar: #2563EB; }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) { --bg: #0B0F17; --track: #272F3C; --bar: #4F86F7; }
+    }
+    :root[data-theme="dark"] { --bg: #0B0F17; --track: #272F3C; --bar: #4F86F7; }
+    html, body { margin: 0; height: 100%; background: var(--bg); }
+    #boot-splash {
+      position: fixed; inset: 0; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 22px;
+      background: var(--bg); transition: opacity .25s ease; z-index: 9999;
+    }
+    #boot-splash img { width: 48px; height: 48px; }
+    #boot-splash .track {
+      width: 120px; height: 3px; border-radius: 3px; overflow: hidden;
+      background: var(--track);
+    }
+    #boot-splash .bar {
+      width: 40%; height: 100%; border-radius: 3px; background: var(--bar);
+      animation: boot-slide 1.1s ease-in-out infinite;
+    }
+    @keyframes boot-slide {
+      0% { transform: translateX(-100%); }
+      100% { transform: translateX(250%); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #boot-splash .bar { animation: none; width: 100%; opacity: .5; }
+    }
+  </style>
+  <script>
+    // Honour the theme the user picked in-app (GetStorage → localStorage):
+    // app_theme_mode 1 = light, 2 = dark, 0/absent = follow the OS.
+    try {
+      var store = JSON.parse(localStorage.getItem('GetStorage') || '{}');
+      var mode = store['app_theme_mode'];
+      if (mode === 1) document.documentElement.setAttribute('data-theme', 'light');
+      if (mode === 2) document.documentElement.setAttribute('data-theme', 'dark');
+    } catch (e) {}
+  </script>
 </head>
 <body>
+  <div id="boot-splash" aria-label="Loading Eldivex" role="progressbar">
+    <img src="splash_mark.png" alt="">
+    <div class="track"><div class="bar"></div></div>
+  </div>
+  <script>
+    window.addEventListener('flutter-first-frame', function () {
+      var el = document.getElementById('boot-splash');
+      if (!el) return;
+      el.style.opacity = '0';
+      setTimeout(function () { el.remove(); }, 260);
+    });
+  </script>
   <!--
     You can customize the "flutter_bootstrap.js" script.
     This is useful to provide a custom configuration to the Flutter loader
