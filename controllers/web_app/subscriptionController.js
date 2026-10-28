@@ -13,11 +13,9 @@ const db     = require('../../config/db');
 const logger = require('../../logger');
 const { getCurrentDateTime } = require('../../utils/dateTime');
 const { logAudit }           = require('../../utils/auditLogger');
-const withTransaction        = require('../../utils/withTransaction');
 const { getOrgId }           = require('../../utils/orgScope');
-const { orgStatusForSubscription } = require('../../utils/orgStatus');
-const { invalidateOrgStatusCache } = require('../../middlewares/orgStatusGate');
 const { countActiveBookings, countActiveHPs } = require('../../utils/planUsage');
+const { applyOrgPlan }       = require('../../utils/orgPlan');
 
 // edx_subscriptions.status values an owner may set directly.
 const SUBSCRIPTION_STATUSES = ['trial', 'active', 'suspended', 'expired', 'cancelled'];
@@ -115,69 +113,17 @@ const updateOrgPlan = async (req, res) => {
     const targetPlan = await db('edx_plans').where('id', plan_id).first();
     if (!targetPlan) return res.status(404).json({ message: 'Plan not found.' });
 
-    // Re-check downgrade viability on the server (can't be bypassed via direct API call)
-    const currentSub = await db('edx_subscriptions')
-      .where('org_id', org_id)
-      .orderBy('id', 'desc')
-      .first();
-
-    if (currentSub && parseInt(currentSub.plan_id) > parseInt(plan_id)) {
-      // Moving to a lower plan — check usage
-      const bookingsUsed = await countActiveBookings(org_id);
-      const hpUsed       = await countActiveHPs(org_id);
-
-      const bookingLimit = targetPlan.booking_limit || 0;
-      const hpLimit      = targetPlan.hp_limit      || 0;
-      const blockReasons = [];
-
-      if (bookingLimit > 0 && bookingsUsed > bookingLimit)
-        blockReasons.push(`${bookingsUsed} active bookings exceed the ${targetPlan.name} limit of ${bookingLimit}`);
-      if (hpLimit > 0 && hpUsed > hpLimit)
-        blockReasons.push(`${hpUsed} active HPs exceed the ${targetPlan.name} limit of ${hpLimit}`);
-
-      if (blockReasons.length > 0) {
-        return res.status(422).json({
-          message: blockReasons.join('. '),
-          code:    'DOWNGRADE_BLOCKED',
-        });
-      }
+    // Downgrade viability is re-checked on the server (can't be bypassed via
+    // a direct API call); one transaction switches the subscription.
+    const result = await applyOrgPlan({
+      orgId: org_id, plan: targetPlan, status, expiresOn: expires_on,
+      changedBy: req.login_data.id, reason,
+    });
+    if (result.blocked) {
+      return res.status(422).json({ message: result.blocked, code: 'DOWNGRADE_BLOCKED' });
     }
 
-    // One transaction: close the live subscription(s), open the new one and
-    // keep edx_organizations (plan + kill-switch status) in lock-step with it.
-    const newOrgStatus = orgStatusForSubscription(status);
-    const id = await withTransaction(async (trx) => {
-      await trx('edx_subscriptions')
-        .where({ org_id })
-        .whereIn('status', ['active', 'trial'])
-        .update({ status: 'cancelled', updated_on: getCurrentDateTime() });
-
-      const [subId] = await trx('edx_subscriptions').insert({
-        org_id,
-        plan_id,
-        status,
-        started_on:    getCurrentDateTime(),
-        expires_on:    expires_on || null,
-        activated_by:  req.login_data.id,
-        created_on:    getCurrentDateTime(),
-      });
-
-      await trx('edx_organizations').where({ id: org_id }).update({ plan_id, status: newOrgStatus });
-      return subId;
-    });
-    invalidateOrgStatusCache(org_id);
-
-    logAudit({
-      entityType: 'ORGANISATION',
-      entityId:   Number(org_id),
-      action:     'STATUS_CHANGE',
-      changedBy:  req.login_data.id,
-      org_id:     Number(org_id),
-      oldValues:  { plan_id: currentSub?.plan_id, sub_status: currentSub?.status, org_status: targetOrg.status },
-      newValues:  { plan_id, status, org_status: newOrgStatus, expires_on: expires_on || null, reason },
-    });
-
-    const sub = await db('edx_subscriptions').where({ id }).first();
+    const sub = await db('edx_subscriptions').where({ id: result.subscriptionId }).first();
     res.json({ message: 'Subscription updated successfully.', data: sub });
   } catch (err) {
     logger.error(`[subscriptionController] updateOrgPlan error: ${err.message}`);
