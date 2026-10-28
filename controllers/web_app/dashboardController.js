@@ -51,8 +51,11 @@ function isBranchScoped(user, branch_id) {
 // Compute the equal-length window immediately preceding [from, to].
 function previousWindow(from, to) {
   const DAY = 24 * 60 * 60 * 1000;
-  const fromDate = new Date(`${from}T00:00:00`);
-  const toDate   = new Date(`${to}T00:00:00`);
+  // UTC midnights, so toISOString() below gives back the same calendar day
+  // whatever the server's timezone (local midnight in IST is the previous day
+  // in UTC).
+  const fromDate = new Date(`${from}T00:00:00Z`);
+  const toDate   = new Date(`${to}T00:00:00Z`);
   const lengthDays = Math.round((toDate - fromDate) / DAY) + 1; // inclusive
   const prevTo   = new Date(fromDate - DAY);
   const prevFrom = new Date(prevTo - (lengthDays - 1) * DAY);
@@ -154,16 +157,21 @@ const getDashboardStats = async (req, res) => {
     const user      = { ...req.login_data, org_id: getOrgId(req) };
     const branch_id = req.query.branch_id ? parseInt(req.query.branch_id) : null;
 
-    // Default date range: last 30 days
-    const today = new Date();
-    const to    = req.query.to   || today.toISOString().slice(0, 10);
-    const from  = req.query.from ||
-      new Date(today - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    // No from/to at all = all time (the app's "All time" preset). With only
+    // one end given, `to` defaults to today and `from` to 30 days back.
+    const today    = new Date();
+    const todayStr = today.toISOString().slice(0, 10);
+    const allTime  = !req.query.from && !req.query.to;
+    const to   = allTime ? null : (req.query.to || todayStr);
+    const from = allTime ? null : (req.query.from ||
+      new Date(today - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10));
 
     const opts = { from, to, branch_id };
-    const prev = previousWindow(from, to);
-    const prevOpts = { from: prev.from, to: prev.to, branch_id };
-    const todayStr = today.toISOString().slice(0, 10);
+    // All time has no previous window, so its trends come back null.
+    const prev = allTime ? null : previousWindow(from, to);
+    const prevOpts = prev && { from: prev.from, to: prev.to, branch_id };
+    const forPrev = (metricFor) =>
+      (prevOpts ? metricFor(user, branch_id, prevOpts) : Promise.resolve(0));
 
     const [
       // current-period summary metrics
@@ -192,12 +200,12 @@ const getDashboardStats = async (req, res) => {
       cancelledBookingsFor(user, branch_id, opts),
       newBookingsTodayFor(user, branch_id, todayStr),
 
-      totalBookingsFor(user, branch_id, prevOpts),
-      activeBookingsFor(user, branch_id, prevOpts),
-      completedBookingsFor(user, branch_id, prevOpts),
-      revenueFor(user, branch_id, prevOpts),
-      collectedFor(user, branch_id, prevOpts),
-      clientsFor(user, branch_id, prevOpts),
+      forPrev(totalBookingsFor),
+      forPrev(activeBookingsFor),
+      forPrev(completedBookingsFor),
+      forPrev(revenueFor),
+      forPrev(collectedFor),
+      forPrev(clientsFor),
 
       // ── Weekly bookings: last 7 days grouped by day-of-week ───────────────
       applyBranchFilter(
